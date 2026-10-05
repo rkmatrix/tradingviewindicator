@@ -355,170 +355,408 @@ def is_market_open() -> bool:
     if now.weekday() > 4:
         return False
     market_open = now.replace(hour=8, minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=15, minute=0, second=0, microsecond=0)
+    market_close = now.replace(hour=15, minute=6, second=0, microsecond=0)   # a few minutes past the close so the 14:55 bar is still evaluated
     return market_open <= now <= market_close
 
 # --- Automated Market Hours Scanner (1-to-1 Pine Script v5 Engine) ---
 scanner_state: Dict[str, Dict] = {} # ticker -> { "last_evaluated_bar": None, "last_dispatched_sig": None }
 
-def evaluate_pine_indicator(df: pd.DataFrame) -> Optional[Dict]:
+# -----------------------------------------------------------------------------
+# These settings MUST mirror the inputs of MultiConfluence_Signal_Indicator.pine.
+# Defaults below equal the indicator defaults. If you change an input on the
+# TradingView chart, mirror it in data/pine_settings.json (same keys) so the
+# Telegram alerts keep firing exactly when the chart prints a flag.
+# -----------------------------------------------------------------------------
+PINE_DEFAULTS: Dict = {
+    # Signal Engine
+    "cooldown_bars": 0,
+    # Trade Lifecycle & Exits
+    "use_dyn_tp": True, "exit_on_sl": True, "exit_on_tp2": True, "be_after_tp1": True, "max_hold_bars": 0,
+    # 1. Trend & Baseline
+    "ema_fast": 9, "ema_med": 21, "ema_slow": 50, "ema_base": 200,
+    "filter_200": "FLEXIBLE",          # FLEXIBLE | STRICT | DISABLED
+    # 1b. Higher-Timeframe Bias
+    "use_htf": False, "htf_minutes": 60, "htf_ema_len": 50,
+    # 2. Momentum
+    "use_rsi": True, "rsi_len": 14, "rsi_bull_buy": 45, "rsi_bear_sell": 55, "bo_rsi_call": 46, "bo_rsi_put": 54,
+    "use_macd": True, "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
+    "use_resume": True, "resume_bars": 3,
+    # 2b. ADX Regime
+    "use_adx": False, "adx_len": 14, "adx_smooth": 14, "adx_min": 20.0,
+    # 3. Volatility, Value Zone & Targets
+    "atr_len": 14, "sl_atr": 1.2, "tp1_atr": 1.5, "tp2_atr": 2.5,
+    "zone_mode": "ATR",                # ATR | PERCENT
+    "zone_tol_pct": 1.2, "zone_depth_pct": 2.5, "zone_tol_atr": 0.5, "zone_depth_atr": 1.0,
+    "fast_zone": True, "fast_touch_atr": 0.15,
+    # 4. Volume
+    "use_vol_filter": True, "vol_baseline": "MEDIAN",   # MEDIAN | SMA
+    "vol_len": 20, "vol_mult": 0.80, "vol_break_mult": 1.10,
+    # 4b. Session (exchange time, HHMM-HHMM)
+    "use_session": False, "session": "0930-1600",
+    # Exchange time zone used for the session filter and HTF bar alignment (TradingView uses the symbol's exchange tz)
+    "exchange_tz": "America/New_York",
+}
+PINE_SETTINGS_FILE = DATA_DIR / "pine_settings.json"
+_pine_settings_cache: Dict = {"mtime": None, "settings": dict(PINE_DEFAULTS)}
+
+def load_pine_settings() -> Dict:
+    """Indicator defaults, optionally overridden by data/pine_settings.json (hot-reloaded)."""
+    try:
+        mtime = PINE_SETTINGS_FILE.stat().st_mtime if PINE_SETTINGS_FILE.exists() else None
+    except OSError:
+        mtime = None
+    if mtime != _pine_settings_cache["mtime"]:
+        s = dict(PINE_DEFAULTS)
+        if mtime is not None:
+            try:
+                user = json.loads(PINE_SETTINGS_FILE.read_text(encoding="utf-8"))
+                unknown = [k for k in user if k not in PINE_DEFAULTS]
+                if unknown:
+                    log.warning("pine_settings.json: ignoring unknown keys %s", unknown)
+                s.update({k: v for k, v in user.items() if k in PINE_DEFAULTS})
+                log.info("Loaded Pine settings overrides from %s", PINE_SETTINGS_FILE)
+            except Exception as e:
+                log.warning("Could not read %s (%s) - using indicator defaults", PINE_SETTINGS_FILE, e)
+        _pine_settings_cache["mtime"] = mtime
+        _pine_settings_cache["settings"] = s
+    return _pine_settings_cache["settings"]
+
+# ---- Pine-exact indicator math ----------------------------------------------
+def _pine_recursive(src: pd.Series, length: int, alpha: float) -> pd.Series:
+    """Pine ta.ema / ta.rma: seeded with the SMA of the first `length` valid values, then recursive."""
+    v = src.to_numpy(dtype=float)
+    n = len(v)
+    out = np.full(n, np.nan)
+    start = None
+    for i in range(length - 1, n):
+        w = v[i - length + 1:i + 1]
+        if not np.isnan(w).any():
+            out[i] = w.mean()
+            start = i
+            break
+    if start is None:
+        return pd.Series(out, index=src.index)
+    prev = out[start]
+    for i in range(start + 1, n):
+        x = v[i]
+        if not np.isnan(x):
+            prev = alpha * x + (1.0 - alpha) * prev
+        out[i] = prev
+    return pd.Series(out, index=src.index)
+
+def pine_ema(src: pd.Series, length: int) -> pd.Series:
+    return _pine_recursive(src, length, 2.0 / (length + 1))
+
+def pine_rma(src: pd.Series, length: int) -> pd.Series:
+    return _pine_recursive(src, length, 1.0 / length)
+
+def pine_rsi(src: pd.Series, length: int) -> pd.Series:
+    chg = src.diff()
+    up = pine_rma(chg.clip(lower=0), length).to_numpy()
+    dn = pine_rma((-chg).clip(lower=0), length).to_numpy()
+    out = np.full(len(up), np.nan)
+    for i in range(len(up)):
+        u, d = up[i], dn[i]
+        if np.isnan(u) or np.isnan(d):
+            continue
+        out[i] = 100.0 if d == 0 else (0.0 if u == 0 else 100.0 - 100.0 / (1.0 + u / d))
+    return pd.Series(out, index=src.index)
+
+def pine_tr(h: pd.Series, l: pd.Series, c: pd.Series) -> pd.Series:
+    pc = c.shift(1)
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    tr.iloc[0] = h.iloc[0] - l.iloc[0]   # ta.tr(true) on the first bar
+    return tr
+
+def pine_dmi(h: pd.Series, l: pd.Series, c: pd.Series, di_len: int, adx_smooth: int):
+    up = h.diff()
+    dn = -l.diff()
+    plus_dm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=h.index).where(up.notna())
+    minus_dm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=h.index).where(dn.notna())
+    trur = pine_rma(pine_tr(h, l, c), di_len)
+    plus = (100 * pine_rma(plus_dm, di_len) / trur).ffill()
+    minus = (100 * pine_rma(minus_dm, di_len) / trur).ffill()
+    s = plus + minus
+    adx = 100 * pine_rma((plus - minus).abs() / s.where(s != 0, 1.0), adx_smooth)
+    return plus, minus, adx
+
+def _crossover(a_now, a_prev, b_now, b_prev) -> bool:
+    return (not np.isnan(a_prev)) and (not np.isnan(b_prev)) and a_now > b_now and a_prev <= b_prev
+
+def _crossunder(a_now, a_prev, b_now, b_prev) -> bool:
+    return (not np.isnan(a_prev)) and (not np.isnan(b_prev)) and a_now < b_now and a_prev >= b_prev
+
+def _parse_session(sess: str):
+    try:
+        a, b = sess.split("-")
+        return (int(a[:2]) * 60 + int(a[2:4]), int(b[:2]) * 60 + int(b[2:4]))
+    except Exception:
+        return (9 * 60 + 30, 16 * 60)
+
+def _htf_series(df: pd.DataFrame, minutes: int, ema_len: int):
     """
-    1-to-1 exact Python replica of MultiConfluence_Signal_Indicator.pine (TradingView v5)
-    Evaluates historical closed bars sequentially with full confluence & dynamic TP state machine.
+    request.security(tf, ema(close, len)[1] / close[1], lookahead_on): for each chart bar, the values of the
+    LAST COMPLETED higher-timeframe bar. HTF buckets are anchored to 09:30 exchange time like TradingView.
     """
-    if df is None or len(df) < 50:
+    rule = f"{int(minutes)}min"
+    htf = df["Close"].resample(rule, label="left", closed="left", origin="start_day", offset="9h30min").last().dropna()
+    htf_ema = pine_ema(htf, ema_len).shift(1)
+    htf_close = htf.shift(1)
+    bucket = (df.index - pd.Timedelta("9h30min")).floor(rule) + pd.Timedelta("9h30min")
+    return htf_ema.reindex(bucket).to_numpy(), htf_close.reindex(bucket).to_numpy()
+
+def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -> Optional[Dict]:
+    """
+    Line-by-line Python port of MultiConfluence_Signal_Indicator.pine (TradingView v5).
+    Replays the full engine (dual-engine confluence + trade lifecycle state machine) over closed bars
+    and reports the events (TP_CALL / TP_PUT / CALL / PUT) that printed on the most recent closed bar.
+    """
+    S = settings or load_pine_settings()
+    if df is None or len(df) < max(S["ema_base"], 60):
         return None
+    if getattr(df.index, "tz", None) is not None:
+        df = df.tz_convert(S["exchange_tz"])   # yfinance may return UTC; Pine sessions / HTF bars are exchange-local
 
-    c = df['Close']
-    o = df['Open']
-    h = df['High']
-    l = df['Low']
-    v = df['Volume']
+    c = df["Close"].astype(float)
+    o = df["Open"].astype(float)
+    h = df["High"].astype(float)
+    l = df["Low"].astype(float)
+    v = df["Volume"].astype(float) if "Volume" in df.columns else pd.Series(np.nan, index=df.index)
 
-    ema9 = c.ewm(span=9, adjust=False).mean()
-    ema21 = c.ewm(span=21, adjust=False).mean()
-    ema50 = c.ewm(span=50, adjust=False).mean()
+    # --- 2. INDICATOR CORE CALCULATIONS ---
+    ema_fast = pine_ema(c, S["ema_fast"]).to_numpy()
+    ema_med = pine_ema(c, S["ema_med"]).to_numpy()
+    ema_slow = pine_ema(c, S["ema_slow"]).to_numpy()
+    ema_base = pine_ema(c, S["ema_base"]).to_numpy()
+    rsi = pine_rsi(c, S["rsi_len"]).to_numpy()
+    macd_line = pine_ema(c, S["macd_fast"]) - pine_ema(c, S["macd_slow"])
+    hist = (macd_line - pine_ema(macd_line, S["macd_signal"])).to_numpy()
+    atr = pine_rma(pine_tr(h, l, c), S["atr_len"]).to_numpy()
+    if S["use_adx"]:
+        _, _, adx_s = pine_dmi(h, l, c, S["adx_len"], S["adx_smooth"])
+        adx = adx_s.to_numpy()
+    else:
+        adx = np.full(len(c), np.nan)
 
-    # Wilder RSI 14
-    delta = c.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
-    rs = avg_gain / (avg_loss.replace(0, 0.0001))
-    rsi = 100 - (100 / (1 + rs))
+    vol_sma = v.rolling(S["vol_len"]).mean()
+    vol_med = v.rolling(S["vol_len"]).median()
+    vol_base = (vol_sma if str(S["vol_baseline"]).upper().startswith("SMA") else vol_med).to_numpy()
+    vol = v.to_numpy()
 
-    # MACD (12, 26, 9)
-    ema12 = c.ewm(span=12, adjust=False).mean()
-    ema26 = c.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    hist = macd - signal
+    if S["use_htf"]:
+        htf_ema, htf_close = _htf_series(df, S["htf_minutes"], S["htf_ema_len"])
+    else:
+        htf_ema = htf_close = None
 
-    vol_ma = v.rolling(20).mean()
+    sess_start, sess_end = _parse_session(S["session"])
+    idx = df.index
+    tod = (idx.hour * 60 + idx.minute) if S["use_session"] else None
 
-    # Determine confirmed closed bar boundary
-    # In 5m bars, if the latest bar timestamp is within 5m of now, it is currently forming/ticking.
-    # The last confirmed closed bar is at len(df) - 2.
+    cn, on, hn, ln = c.to_numpy(), o.to_numpy(), h.to_numpy(), l.to_numpy()
+
+    # --- Closed-bar boundary: the latest yfinance row is the bar that is still forming ---
     now = datetime.now(timezone.utc)
-    last_bar_time = df.index[-1]
-    if hasattr(last_bar_time, 'tzinfo') and last_bar_time.tzinfo is not None:
-        bar_utc = last_bar_time.astimezone(timezone.utc)
-    else:
-        bar_utc = last_bar_time.replace(tzinfo=timezone.utc)
-
-    if (now - bar_utc).total_seconds() < 300:
-        closed_end_idx = len(df) - 1
-    else:
-        closed_end_idx = len(df)
-
-    if closed_end_idx < 30:
+    last_bar_time = idx[-1]
+    bar_utc = last_bar_time.astimezone(timezone.utc) if last_bar_time.tzinfo is not None else last_bar_time.replace(tzinfo=timezone.utc)
+    closed_end_idx = len(df) - 1 if (now - bar_utc).total_seconds() < 310 else len(df)
+    if closed_end_idx < max(S["ema_base"], 60):
         return None
 
-    signal_dir = 0 # 1 = CALL, -1 = PUT, 0 = FLAT / EXITED
-    in_call = False
-    in_put = False
-    signals = []
+    sig_mode = load_env_var("SIGNAL_MODE", SIGNAL_MODE).upper()
+    strict200 = str(S["filter_200"]).upper().startswith("STRICT")
+    use_rsi, use_macd = bool(S["use_rsi"]), bool(S["use_macd"])
+    no_mom_filter = not use_rsi and not use_macd
+    zone_atr = str(S["zone_mode"]).upper() == "ATR"
+
+    # --- 4. TRADE LIFECYCLE STATE (var) ---
+    pos_dir = 0
+    entry_px = sl_level = tp1_level = tp2_level = np.nan
+    tp1_done = False
+    entry_bar = None
+    last_exit_bar = None
+    engine_used = ""
+    last_bull_touch = None   # for ta.barssince(bullTouch)
+    last_bear_touch = None
+
+    all_signals: List[Dict] = []
 
     for i in range(1, closed_end_idx):
-        t = df.index[i]
-        curr_c = c.iloc[i]
-        curr_o = o.iloc[i]
-        curr_h = h.iloc[i]
-        curr_l = l.iloc[i]
-        curr_v = v.iloc[i]
-        curr_vol_ma = vol_ma.iloc[i]
+        close, open_, high, low = cn[i], on[i], hn[i], ln[i]
+        ef, em, es, eb = ema_fast[i], ema_med[i], ema_slow[i], ema_base[i]
+        r, hl, a = rsi[i], hist[i], atr[i]
+        if any(np.isnan(x) for x in (ef, em, es, r, hl, a)) or (strict200 and np.isnan(eb)):
+            continue
+        hl_prev, r_prev = hist[i - 1], rsi[i - 1]
 
-        curr_rsi = rsi.iloc[i]
-        prev_rsi = rsi.iloc[i-1]
+        # Volume (gracefully degrades on symbols with no volume feed)
+        vb = vol_base[i]
+        has_volume = (not np.isnan(vol[i])) and (not np.isnan(vb)) and vb > 0
+        vol_ok_pull = (not S["use_vol_filter"]) or (not has_volume) or vol[i] >= vb * S["vol_mult"]
+        vol_ok_break = (not S["use_vol_filter"]) or (not has_volume) or vol[i] >= vb * S["vol_break_mult"]
 
-        curr_hist = hist.iloc[i]
-        prev_hist = hist.iloc[i-1]
-
-        curr_ema9 = ema9.iloc[i]
-        prev_ema9 = ema9.iloc[i-1]
-        curr_ema21 = ema21.iloc[i]
-        prev_ema21 = ema21.iloc[i-1]
-        curr_ema50 = ema50.iloc[i]
-
-        # Engine A: Trend Pullback Setup (Value Zone)
-        bull_trend = (curr_c > curr_ema50) and (curr_ema21 > curr_ema50)
-        bear_trend = (curr_c < curr_ema50) and (curr_ema21 < curr_ema50)
-
-        bull_dip = (curr_l <= curr_ema21 * 1.012) and (curr_c >= curr_ema50 * 0.975)
-        bear_rally = (curr_h >= curr_ema21 * 0.988) and (curr_c <= curr_ema50 * 1.025)
-
-        rsi_bull_turn = (curr_rsi > 45 and prev_rsi <= 45)
-        macd_bull_turn = (curr_hist > 0 and prev_hist <= 0)
-        bull_trigger = rsi_bull_turn or macd_bull_turn
-
-        rsi_bear_turn = (curr_rsi < 55 and prev_rsi >= 55)
-        macd_bear_turn = (curr_hist < 0 and prev_hist >= 0)
-        bear_trigger = rsi_bear_turn or macd_bear_turn
-
-        vol_confirmed_pb = (curr_v >= (curr_vol_ma * 0.80))
-        pullback_call = bull_trend and bull_dip and bull_trigger and vol_confirmed_pb
-        pullback_put = bear_trend and bear_rally and bear_trigger and vol_confirmed_pb
-
-        # Engine B: Institutional Volume Breakout & V-Bottom Reversal
-        # Genuine breakout requires price to emerge from below/crossing EMAs rather than an extended high candle
-        was_below_or_crossing_call = (c.iloc[i-1] <= prev_ema9) or (c.iloc[i-1] <= prev_ema21) or (curr_o <= curr_ema9) or (curr_o <= curr_ema21)
-        vol_confirmed_bo = (curr_v >= (curr_vol_ma * 1.10))
-        breakout_call = was_below_or_crossing_call and (curr_c > curr_ema9) and (curr_c > curr_ema21) and (curr_c > curr_o) and vol_confirmed_bo and (curr_hist > 0) and (curr_rsi >= 46) and (curr_hist > prev_hist)
-
-        was_above_or_crossing_put = (c.iloc[i-1] >= prev_ema9) or (c.iloc[i-1] >= prev_ema21) or (curr_o >= curr_ema9) or (curr_o >= curr_ema21)
-        breakout_put = was_above_or_crossing_put and (curr_c < curr_ema9) and (curr_c < curr_ema21) and (curr_c < curr_o) and vol_confirmed_bo and (curr_hist < 0) and (curr_rsi <= 54) and (curr_hist < prev_hist)
-
-        sig_mode = load_env_var("SIGNAL_MODE", SIGNAL_MODE).upper()
-        if "PULLBACK" in sig_mode:
-            raw_call = pullback_call
-            raw_put = pullback_put
-        elif "BREAKOUT" in sig_mode:
-            raw_call = breakout_call
-            raw_put = breakout_put
+        # Higher-timeframe bias
+        if htf_ema is not None:
+            he, hc = htf_ema[i], htf_close[i]
+            htf_ok_call = (not np.isnan(he)) and (not np.isnan(hc)) and hc > he
+            htf_ok_put = (not np.isnan(he)) and (not np.isnan(hc)) and hc < he
         else:
-            raw_call = pullback_call or breakout_call
-            raw_put = pullback_put or breakout_put
+            htf_ok_call = htf_ok_put = True
 
-        call_sig = raw_call and (signal_dir != 1)
-        put_sig = raw_put and (signal_dir != -1)
+        # Session / regime gates (bar-close gate is implicit: only closed bars are replayed)
+        in_session = (not S["use_session"]) or (sess_start <= tod[i] < sess_end)
+        adx_ok = (not S["use_adx"]) or ((not np.isnan(adx[i])) and adx[i] >= S["adx_min"])
+        gate_ok = in_session and adx_ok
 
-        # Dynamic Take Profit Signals
-        tp_call = in_call and not call_sig and ((curr_c < curr_ema9 and c.iloc[i-1] >= prev_ema9) or (curr_hist < 0 and prev_hist >= 0))
-        tp_put = in_put and not put_sig and ((curr_c > curr_ema9 and c.iloc[i-1] <= prev_ema9) or (curr_hist > 0 and prev_hist <= 0))
+        # Cross events
+        rsi_bull_turn = _crossover(r, r_prev, S["rsi_bull_buy"], S["rsi_bull_buy"])
+        rsi_bear_turn = _crossunder(r, r_prev, S["rsi_bear_sell"], S["rsi_bear_sell"])
+        macd_bull_turn = _crossover(hl, hl_prev, 0.0, 0.0)
+        macd_bear_turn = _crossunder(hl, hl_prev, 0.0, 0.0)
+        close_over_fast = _crossover(close, cn[i - 1], ef, ema_fast[i - 1])
+        close_under_fast = _crossunder(close, cn[i - 1], ef, ema_fast[i - 1])
 
-        if call_sig:
-            signal_dir = 1
-            in_call = True
-            in_put = False
-            signals.append({'bar_time': str(t), 'type': 'CALL', 'price': float(curr_c), 'bar_idx': i})
-        elif put_sig:
-            signal_dir = -1
-            in_put = True
-            in_call = False
-            signals.append({'bar_time': str(t), 'type': 'PUT', 'price': float(curr_c), 'bar_idx': i})
-        elif tp_call:
-            in_call = False
-            signal_dir = 0
-            signals.append({'bar_time': str(t), 'type': 'TP_CALL', 'price': float(curr_c), 'bar_idx': i})
-        elif tp_put:
-            in_put = False
-            signal_dir = 0
-            signals.append({'bar_time': str(t), 'type': 'TP_PUT', 'price': float(curr_c), 'bar_idx': i})
+        # --- 3. DUAL-ENGINE CONFLUENCE EVALUATION ---
+        pass200_call = (not strict200) or close > eb
+        pass200_put = (not strict200) or close < eb
+
+        bull_trend = (close > eb if strict200 else close > es) and em > es
+        bear_trend = (close < eb if strict200 else close < es) and em < es
+
+        zone_reach = a * S["zone_tol_atr"] if zone_atr else em * S["zone_tol_pct"] / 100
+        zone_depth = a * S["zone_depth_atr"] if zone_atr else es * S["zone_depth_pct"] / 100
+        fast_touch = a * S["fast_touch_atr"]
+
+        bull_touch = low <= em + zone_reach or (S["fast_zone"] and low <= ef + fast_touch)
+        bear_touch = high >= em - zone_reach or (S["fast_zone"] and high >= ef - fast_touch)
+        if bull_touch:
+            last_bull_touch = i
+        if bear_touch:
+            last_bear_touch = i
+        bull_depth_ok = close >= es - zone_depth
+        bear_depth_ok = close <= es + zone_depth
+        bull_dip = bull_touch and bull_depth_ok
+        bear_rally = bear_touch and bear_depth_ok
+
+        bull_turn = no_mom_filter or (use_rsi and rsi_bull_turn) or (use_macd and macd_bull_turn)
+        bear_turn = no_mom_filter or (use_rsi and rsi_bear_turn) or (use_macd and macd_bear_turn)
+
+        bull_touched_recently = last_bull_touch is not None and (i - last_bull_touch) < S["resume_bars"]
+        bear_touched_recently = last_bear_touch is not None and (i - last_bear_touch) < S["resume_bars"]
+        bull_resume = S["use_resume"] and bull_touched_recently and bull_depth_ok and close > ef and close > open_ and (not use_rsi or r > 50) and (not use_macd or hl > 0)
+        bear_resume = S["use_resume"] and bear_touched_recently and bear_depth_ok and close < ef and close < open_ and (not use_rsi or r < 50) and (not use_macd or hl < 0)
+
+        pullback_call = bull_trend and pass200_call and vol_ok_pull and ((bull_dip and bull_turn) or bull_resume)
+        pullback_put = bear_trend and pass200_put and vol_ok_pull and ((bear_rally and bear_turn) or bear_resume)
+
+        # Engine B: Volume Breakout / V-Reversal through the 9 & 21 EMA
+        was_below_call = cn[i - 1] <= ema_fast[i - 1] or cn[i - 1] <= ema_med[i - 1] or open_ <= ef or open_ <= em
+        was_above_put = cn[i - 1] >= ema_fast[i - 1] or cn[i - 1] >= ema_med[i - 1] or open_ >= ef or open_ >= em
+        bo_macd_call = (not use_macd) or (hl > 0 and hl > hl_prev)
+        bo_macd_put = (not use_macd) or (hl < 0 and hl < hl_prev)
+        bo_rsi_ok_call = (not use_rsi) or r >= S["bo_rsi_call"]
+        bo_rsi_ok_put = (not use_rsi) or r <= S["bo_rsi_put"]
+
+        breakout_call = was_below_call and close > ef and close > em and close > open_ and vol_ok_break and bo_macd_call and bo_rsi_ok_call and pass200_call
+        breakout_put = was_above_put and close < ef and close < em and close < open_ and vol_ok_break and bo_macd_put and bo_rsi_ok_put and pass200_put
+
+        if "PULLBACK" in sig_mode:
+            mode_call, mode_put = pullback_call, pullback_put
+        elif "BREAKOUT" in sig_mode:
+            mode_call, mode_put = breakout_call, breakout_put
+        else:
+            mode_call, mode_put = (pullback_call or breakout_call), (pullback_put or breakout_put)
+
+        raw_call_pre = gate_ok and htf_ok_call and mode_call
+        raw_put_pre = gate_ok and htf_ok_put and mode_put
+        conflict = raw_call_pre and raw_put_pre
+        raw_call = raw_call_pre and not conflict
+        raw_put = raw_put_pre and not conflict
+
+        # --- 4. TRADE LIFECYCLE STATE MACHINE ---
+        in_call = pos_dir == 1
+        in_put = pos_dir == -1
+        after_entry = entry_bar is not None and i > entry_bar
+
+        call_sl_hit = in_call and after_entry and S["exit_on_sl"] and low <= sl_level
+        call_tp1_hit = in_call and after_entry and not tp1_done and high >= tp1_level
+        call_tp2_hit = in_call and after_entry and S["exit_on_tp2"] and high >= tp2_level
+        call_dyn_tp = in_call and after_entry and S["use_dyn_tp"] and (close_under_fast or macd_bear_turn)
+        call_time_up = in_call and after_entry and S["max_hold_bars"] > 0 and i - entry_bar >= S["max_hold_bars"]
+
+        put_sl_hit = in_put and after_entry and S["exit_on_sl"] and high >= sl_level
+        put_tp1_hit = in_put and after_entry and not tp1_done and low <= tp1_level
+        put_tp2_hit = in_put and after_entry and S["exit_on_tp2"] and low <= tp2_level
+        put_dyn_tp = in_put and after_entry and S["use_dyn_tp"] and (close_over_fast or macd_bull_turn)
+        put_time_up = in_put and after_entry and S["max_hold_bars"] > 0 and i - entry_bar >= S["max_hold_bars"]
+
+        call_exit_code = (6 if tp1_done else 3) if call_sl_hit else 2 if call_tp2_hit else 1 if call_dyn_tp else 4 if call_time_up else 0
+        put_exit_code = (6 if tp1_done else 3) if put_sl_hit else 2 if put_tp2_hit else 1 if put_dyn_tp else 4 if put_time_up else 0
+
+        cooldown_ok = S["cooldown_bars"] == 0 or last_exit_bar is None or i - last_exit_bar >= S["cooldown_bars"]
+        call_signal = raw_call and not in_call and cooldown_ok
+        put_signal = raw_put and not in_put and cooldown_ok
+
+        exit_call = in_call and (call_exit_code > 0 or put_signal)
+        exit_put = in_put and (put_exit_code > 0 or call_signal)
+        exit_code = (call_exit_code if call_exit_code > 0 else 5) if exit_call else (put_exit_code if put_exit_code > 0 else 5) if exit_put else 0
+
+        exit_px = np.nan
+        stop_exit = exit_code in (3, 6)
+        if exit_call:
+            exit_px = min(open_, sl_level) if stop_exit else max(open_, tp2_level) if exit_code == 2 else close
+        if exit_put:
+            exit_px = max(open_, sl_level) if stop_exit else min(open_, tp2_level) if exit_code == 2 else close
+
+        exit_pnl = np.nan
+        if exit_call:
+            exit_pnl = (exit_px - entry_px) / entry_px * 100
+        if exit_put:
+            exit_pnl = (entry_px - exit_px) / entry_px * 100
+
+        if call_tp1_hit or put_tp1_hit:
+            tp1_done = True
+            if S["be_after_tp1"] and not exit_call and not exit_put:
+                sl_level = entry_px
+
+        t = str(idx[i])
+        bar_events: List[Dict] = []
+        # Exits before entries so a reversal arrives as TP_x followed by BUY_y (same as the Pine alert() path)
+        if exit_call or exit_put:
+            bar_events.append({"bar_time": t, "type": "TP_CALL" if exit_call else "TP_PUT", "price": float(exit_px),
+                               "exit_code": exit_code, "pnl_pct": None if np.isnan(exit_pnl) else round(float(exit_pnl), 2),
+                               "engine": engine_used, "bar_idx": i})
+            pos_dir = 0
+            last_exit_bar = i
+            entry_bar = None
+
+        if call_signal or put_signal:
+            pos_dir = 1 if call_signal else -1
+            entry_px = close
+            entry_bar = i
+            tp1_done = False
+            engine_used = "PULLBACK" if (pullback_call if call_signal else pullback_put) else "BREAKOUT"
+            sgn = 1 if call_signal else -1
+            sl_level = close - sgn * a * S["sl_atr"]
+            tp1_level = close + sgn * a * S["tp1_atr"]
+            tp2_level = close + sgn * a * S["tp2_atr"]
+            bar_events.append({"bar_time": t, "type": "CALL" if call_signal else "PUT", "price": float(close),
+                               "sl": float(sl_level), "tp1": float(tp1_level), "tp2": float(tp2_level),
+                               "engine": engine_used, "bar_idx": i})
+
+        all_signals.extend(bar_events)
 
     last_closed_bar_idx = closed_end_idx - 1
-    last_closed_bar_time = str(df.index[last_closed_bar_idx])
-
-    # Check if a new confirmed signal occurred on the most recent closed bar
-    new_event = None
-    if signals and signals[-1]['bar_idx'] == last_closed_bar_idx:
-        new_event = signals[-1]
+    last_closed_bar_time = str(idx[last_closed_bar_idx])
+    events = [s for s in all_signals if s["bar_idx"] == last_closed_bar_idx]
 
     return {
-        'last_closed_bar_time': last_closed_bar_time,
-        'position': 'CALL' if in_call else ('PUT' if in_put else 'FLAT'),
-        'new_event': new_event,
-        'latest_signal': signals[-1] if signals else None
+        "last_closed_bar_time": last_closed_bar_time,
+        "position": "CALL" if pos_dir == 1 else ("PUT" if pos_dir == -1 else "FLAT"),
+        "entry_price": None if np.isnan(entry_px) or pos_dir == 0 else float(entry_px),
+        "new_events": events,
+        "new_event": events[-1] if events else None,
+        "latest_signal": all_signals[-1] if all_signals else None,
+        "signals": all_signals,
     }
 
 async def market_scanner_loop():
@@ -533,11 +771,13 @@ async def market_scanner_loop():
             if should_scan:
                 raw_wl = load_env_var("WATCHLIST", WATCHLIST_STR)
                 wl = [t.strip().upper() for t in raw_wl.split(",") if t.strip()]
-                yf_map = {tk: ("^SPX" if tk == "SPX" else tk) for tk in wl}
+                # Yahoo's ^SPX feed is 15 minutes delayed; ^GSPC is the same index in real time
+                yf_map = {tk: ("^GSPC" if tk in ("SPX", "^SPX") else tk) for tk in wl}
                 tickers_str = " ".join(list(dict.fromkeys(yf_map.values())))
 
-                # Batch download past 5 days of 5m candles (sufficient warmup for EMA50, EMA200, MACD, RSI)
-                data = await asyncio.to_thread(yf.download, tickers=tickers_str, period="5d", interval="5m", progress=False)
+                # 30 days of 5m candles (~2,300 bars): lets the 200 EMA, RMA-based RSI / ATR and the trade state
+                # machine fully converge to what the TradingView chart shows (5 days was not enough warm-up).
+                data = await asyncio.to_thread(yf.download, tickers=tickers_str, period="30d", interval="5m", progress=False, auto_adjust=False)
 
                 if data is not None and not data.empty:
                     for tk in wl:
@@ -548,10 +788,10 @@ async def market_scanner_loop():
                             else:
                                 df = data if len(wl) == 1 else None
 
-                            if df is None or df.empty or len(df) < 50:
+                            if df is None or df.empty:
                                 continue
 
-                            df = df.dropna().copy()
+                            df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
                             result = evaluate_pine_indicator(df)
                             if result is None:
                                 continue
@@ -564,14 +804,17 @@ async def market_scanner_loop():
 
                             state["last_evaluated_bar"] = closed_bar_time
 
-                            # If a confirmed signal triggered on this closed bar
-                            if result['new_event']:
-                                sig = result['new_event']
+                            # Every flag the chart printed on this closed bar, in chart order
+                            # (a reversal is TP_CALL/TP_PUT followed by the new CALL/PUT, like the Pine alert() path)
+                            for sig in result['new_events']:
                                 sig_key = f"{sig['type']}_{sig['bar_time']}"
-                                if state.get("last_dispatched_sig") != sig_key:
-                                    state["last_dispatched_sig"] = sig_key
-                                    log.info("Pine Indicator Signal Confirmed: %s %s at %s (Bar: %s)", sig['type'], tk, sig['price'], sig['bar_time'])
-                                    record_and_dispatch(tk, sig['type'], sig['price'])
+                                if state.get("last_dispatched_sig") == sig_key:
+                                    continue
+                                state["last_dispatched_sig"] = sig_key
+                                log.info("Pine Indicator Signal Confirmed: %s %s at %.2f (Bar: %s, engine=%s%s)",
+                                         sig['type'], tk, sig['price'], sig['bar_time'], sig.get('engine'),
+                                         f", exit_code={sig['exit_code']}" if 'exit_code' in sig else "")
+                                record_and_dispatch(tk, sig['type'], sig['price'])
 
                         except Exception as e:
                             log.warning("Error evaluating ticker %s: %s", tk, e)

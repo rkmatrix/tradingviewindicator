@@ -89,6 +89,28 @@ The dashboard (`app.py`) treats any `action` containing `TP` or `EXIT` as a posi
 
 ---
 
+## 🤖 Built-in Telegram Scanner (`app.py`) - Same Engine As The Chart
+
+`app.py` also runs a background scanner that replays a **line-by-line Python port of the indicator** (`evaluate_pine_indicator`) on 5-minute Yahoo Finance data for every ticker in the watchlist, so a Telegram alert is sent at the same bar the chart prints a flag - no TradingView alert subscription needed.
+
+- Pine-exact math: SMA-seeded `ta.ema` / `ta.rma`, Wilder RSI, `ta.atr`, `ta.dmi`, `ta.median` volume baseline, `ta.barssince`, `ta.crossover` semantics, and the full trade-lifecycle state machine (SL / TP1 breakeven / TP2 / momentum fade / time / reversal).
+- Events are dispatched in chart order: a reversal arrives as `TP_CALL` then `PUT` (same as the Pine `alert()` path).
+- 30 days of 5m history are loaded so the 200 EMA and the open-position state converge to what the chart shows.
+- `SPX` is fetched as Yahoo's `^GSPC` (real time); Yahoo's `^SPX` symbol is 15 minutes delayed.
+- Only **closed** bars are evaluated (matches *Evaluate Signals On Bar Close Only*).
+
+**Keep the scanner in sync with your chart inputs.** The scanner uses the indicator's default inputs. If you change any input on the TradingView chart, mirror it in `data/pine_settings.json` (hot-reloaded, keys listed in `PINE_DEFAULTS` inside `app.py`), e.g.:
+
+```json
+{ "cooldown_bars": 2, "use_adx": true, "adx_min": 22, "exchange_tz": "America/New_York" }
+```
+
+`SIGNAL_MODE` (dashboard setting) still selects *All Confluence / Pullback Only / Breakout Only*.
+
+Known limits: Yahoo's free feed can trail the exchange by a few seconds to a minute and its index prints can differ slightly from TradingView's data vendor, so an entry that sits exactly on a threshold may occasionally differ by one bar. For zero-lag parity on a specific symbol, use the TradingView webhook (Option A above) in addition to or instead of the scanner.
+
+---
+
 ## 💻 How to Add to Webull Desktop
 
 1. Open Webull Desktop and navigate to any stock or ETF chart.
