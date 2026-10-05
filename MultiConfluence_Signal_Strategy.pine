@@ -102,7 +102,7 @@ startDate     = input.time(timestamp("2021-01-01 00:00:00"), "Start Date", group
 endDate       = input.time(timestamp("2030-01-01 00:00:00"), "End Date", group=grp_dates)
 
 grp_vis      = "6. Visuals"
-showSignals  = input.bool(true, "Show CALL / PUT Entry Labels", group=grp_vis)
+showSignals  = input.bool(false, "Show CALL / PUT Entry Labels (Strategy Tester already marks trades)", group=grp_vis)
 showLevels   = input.bool(true, "Show Active Entry / SL / TP Lines", group=grp_vis)
 showStats    = input.bool(true, "Show Performance Table", group=grp_vis)
 statsPos     = input.string("Top Right", "Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grp_vis)
@@ -221,7 +221,7 @@ if inLong and not tp1Done and posSize < nz(posSize[1]) and nz(posSize[1]) > 0
     tp1Done := true
     if beAfterTp1
         slLevel := strategy.position_avg_price
-        strategy.exit("CALL TP2", from_entry="CALL", limit=tp2Level, stop=slLevel, comment_profit="TP2 CALL", comment_loss="BE CALL",
+        strategy.exit("CALL TP2", from_entry="CALL", limit=tp2Level, stop=slLevel, comment_profit="TP CALL", comment_loss="SL CALL",
           alert_profit=f_json("TP_CALL", engineUsed, "TP2_TARGET", tp2Level, slLevel, tp1Level, tp2Level),
           alert_loss=f_json("TP_CALL", engineUsed, "BREAKEVEN_STOP", slLevel, slLevel, tp1Level, tp2Level))
 
@@ -229,7 +229,7 @@ if inShort and not tp1Done and posSize > nz(posSize[1]) and nz(posSize[1]) < 0
     tp1Done := true
     if beAfterTp1
         slLevel := strategy.position_avg_price
-        strategy.exit("PUT TP2", from_entry="PUT", limit=tp2Level, stop=slLevel, comment_profit="TP2 PUT", comment_loss="BE PUT",
+        strategy.exit("PUT TP2", from_entry="PUT", limit=tp2Level, stop=slLevel, comment_profit="TP PUT", comment_loss="SL PUT",
           alert_profit=f_json("TP_PUT", engineUsed, "TP2_TARGET", tp2Level, slLevel, tp1Level, tp2Level),
           alert_loss=f_json("TP_PUT", engineUsed, "BREAKEVEN_STOP", slLevel, slLevel, tp1Level, tp2Level))
 
@@ -243,19 +243,19 @@ bool shortOpp = inShort and exitOnOpp and rawCall
 
 if inLong and not putSignal
     if longDyn
-        strategy.close("CALL", comment="TP CALL (Momentum)", alert_message=f_json("TP_CALL", engineUsed, "MOMENTUM_FADE", close, slLevel, tp1Level, tp2Level))
+        strategy.close("CALL", comment="TP CALL", alert_message=f_json("TP_CALL", engineUsed, "MOMENTUM_FADE", close, slLevel, tp1Level, tp2Level))
     else if longTime
-        strategy.close("CALL", comment="Time Exit CALL", alert_message=f_json("TP_CALL", engineUsed, "TIME_EXIT", close, slLevel, tp1Level, tp2Level))
+        strategy.close("CALL", comment="TP CALL", alert_message=f_json("TP_CALL", engineUsed, "TIME_EXIT", close, slLevel, tp1Level, tp2Level))
     else if longOpp
-        strategy.close("CALL", comment="Opposite Signal", alert_message=f_json("TP_CALL", engineUsed, "OPPOSITE_SIGNAL", close, slLevel, tp1Level, tp2Level))
+        strategy.close("CALL", comment="TP CALL", alert_message=f_json("TP_CALL", engineUsed, "OPPOSITE_SIGNAL", close, slLevel, tp1Level, tp2Level))
 
 if inShort and not callSignal
     if shortDyn
-        strategy.close("PUT", comment="TP PUT (Momentum)", alert_message=f_json("TP_PUT", engineUsed, "MOMENTUM_FADE", close, slLevel, tp1Level, tp2Level))
+        strategy.close("PUT", comment="TP PUT", alert_message=f_json("TP_PUT", engineUsed, "MOMENTUM_FADE", close, slLevel, tp1Level, tp2Level))
     else if shortTime
-        strategy.close("PUT", comment="Time Exit PUT", alert_message=f_json("TP_PUT", engineUsed, "TIME_EXIT", close, slLevel, tp1Level, tp2Level))
+        strategy.close("PUT", comment="TP PUT", alert_message=f_json("TP_PUT", engineUsed, "TIME_EXIT", close, slLevel, tp1Level, tp2Level))
     else if shortOpp
-        strategy.close("PUT", comment="Opposite Signal", alert_message=f_json("TP_PUT", engineUsed, "OPPOSITE_SIGNAL", close, slLevel, tp1Level, tp2Level))
+        strategy.close("PUT", comment="TP PUT", alert_message=f_json("TP_PUT", engineUsed, "OPPOSITE_SIGNAL", close, slLevel, tp1Level, tp2Level))
 
 // 4c. Entries (and reversals). Stops / targets are armed on the SAME bar as the entry.
 float riskQty = math.max(1, math.floor(strategy.equity * riskPct / 100 / math.max(atrVal * slAtrMult, syminfo.mintick)))
@@ -264,7 +264,7 @@ if callSignal
     if inShort
         strategy.cancel("PUT TP1")
         strategy.cancel("PUT TP2")
-        strategy.close("PUT", comment="Reversal -> CALL", alert_message=f_json("TP_PUT", engineUsed, "REVERSAL", close, slLevel, tp1Level, tp2Level))
+        strategy.close("PUT", comment="TP PUT", alert_message=f_json("TP_PUT", engineUsed, "REVERSAL", close, slLevel, tp1Level, tp2Level))
     entryPx    := close
     entryBar   := bar_index
     tp1Done    := false
@@ -274,14 +274,14 @@ if callSignal
     tp2Level   := close + atrVal * tp2AtrMult
     string callMsg = f_json("BUY_CALL", engineUsed, "ENTRY", close, slLevel, tp1Level, tp2Level)
     if useRiskSize
-        strategy.entry("CALL", strategy.long, qty=riskQty, comment="CALL " + engineUsed, alert_message=callMsg)
+        strategy.entry("CALL", strategy.long, qty=riskQty, comment="CALL", alert_message=callMsg)
     else
-        strategy.entry("CALL", strategy.long, comment="CALL " + engineUsed, alert_message=callMsg)
+        strategy.entry("CALL", strategy.long, comment="CALL", alert_message=callMsg)
     if tp1Pct > 0
-        strategy.exit("CALL TP1", from_entry="CALL", qty_percent=tp1Pct, limit=tp1Level, stop=slLevel, comment_profit="TP1 CALL", comment_loss="SL CALL",
+        strategy.exit("CALL TP1", from_entry="CALL", qty_percent=tp1Pct, limit=tp1Level, stop=slLevel, comment_profit="TP CALL", comment_loss="SL CALL",
           alert_profit='{"action": "TP1_TRIM_CALL", "ticker": "' + syminfo.ticker + '", "price": ' + f_num(tp1Level) + '}',
           alert_loss=f_json("TP_CALL", engineUsed, "STOP_LOSS", slLevel, slLevel, tp1Level, tp2Level))
-    strategy.exit("CALL TP2", from_entry="CALL", limit=tp2Level, stop=slLevel, comment_profit="TP2 CALL", comment_loss="SL CALL",
+    strategy.exit("CALL TP2", from_entry="CALL", limit=tp2Level, stop=slLevel, comment_profit="TP CALL", comment_loss="SL CALL",
       alert_profit=f_json("TP_CALL", engineUsed, "TP2_TARGET", tp2Level, slLevel, tp1Level, tp2Level),
       alert_loss=f_json("TP_CALL", engineUsed, "STOP_LOSS", slLevel, slLevel, tp1Level, tp2Level))
 
@@ -289,7 +289,7 @@ if putSignal
     if inLong
         strategy.cancel("CALL TP1")
         strategy.cancel("CALL TP2")
-        strategy.close("CALL", comment="Reversal -> PUT", alert_message=f_json("TP_CALL", engineUsed, "REVERSAL", close, slLevel, tp1Level, tp2Level))
+        strategy.close("CALL", comment="TP CALL", alert_message=f_json("TP_CALL", engineUsed, "REVERSAL", close, slLevel, tp1Level, tp2Level))
     entryPx    := close
     entryBar   := bar_index
     tp1Done    := false
@@ -299,14 +299,14 @@ if putSignal
     tp2Level   := close - atrVal * tp2AtrMult
     string putMsg = f_json("BUY_PUT", engineUsed, "ENTRY", close, slLevel, tp1Level, tp2Level)
     if useRiskSize
-        strategy.entry("PUT", strategy.short, qty=riskQty, comment="PUT " + engineUsed, alert_message=putMsg)
+        strategy.entry("PUT", strategy.short, qty=riskQty, comment="PUT", alert_message=putMsg)
     else
-        strategy.entry("PUT", strategy.short, comment="PUT " + engineUsed, alert_message=putMsg)
+        strategy.entry("PUT", strategy.short, comment="PUT", alert_message=putMsg)
     if tp1Pct > 0
-        strategy.exit("PUT TP1", from_entry="PUT", qty_percent=tp1Pct, limit=tp1Level, stop=slLevel, comment_profit="TP1 PUT", comment_loss="SL PUT",
+        strategy.exit("PUT TP1", from_entry="PUT", qty_percent=tp1Pct, limit=tp1Level, stop=slLevel, comment_profit="TP PUT", comment_loss="SL PUT",
           alert_profit='{"action": "TP1_TRIM_PUT", "ticker": "' + syminfo.ticker + '", "price": ' + f_num(tp1Level) + '}',
           alert_loss=f_json("TP_PUT", engineUsed, "STOP_LOSS", slLevel, slLevel, tp1Level, tp2Level))
-    strategy.exit("PUT TP2", from_entry="PUT", limit=tp2Level, stop=slLevel, comment_profit="TP2 PUT", comment_loss="SL PUT",
+    strategy.exit("PUT TP2", from_entry="PUT", limit=tp2Level, stop=slLevel, comment_profit="TP PUT", comment_loss="SL PUT",
       alert_profit=f_json("TP_PUT", engineUsed, "TP2_TARGET", tp2Level, slLevel, tp1Level, tp2Level),
       alert_loss=f_json("TP_PUT", engineUsed, "STOP_LOSS", slLevel, slLevel, tp1Level, tp2Level))
 

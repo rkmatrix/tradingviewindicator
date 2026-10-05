@@ -28,8 +28,9 @@ exitOnTp2    = input.bool(true, "Exit When TP2 (Runner) Is Hit", group=grp_exit)
 beAfterTp1   = input.bool(true, "Move Stop To Entry After TP1 Is Hit", group=grp_exit)
 maxHoldBars  = input.int(0, "Max Holding Bars - Theta Protection (0 = Off)", minval=0, group=grp_exit,
       tooltip="Force an exit after this many bars in a trade. Useful for intraday options where theta decay dominates. 0 disables the time exit.")
-showTpLabels = input.bool(true, "Show Exit Labels (TP / SL / EXIT)", group=grp_exit)
-showTp1Marks = input.bool(true, "Show TP1 Trim Markers", group=grp_exit)
+exitLabels   = input.string("Simple (TP CALL / TP PUT)", "Exit Labels", options=["Simple (TP CALL / TP PUT)", "Detailed (TP / SL / BE / EXIT)", "Off"], group=grp_exit,
+      tooltip="Simple shows one TP CALL / TP PUT label for every exit (matches the dashboard). Detailed distinguishes stop-loss, breakeven and time exits.")
+showTp1Marks = input.bool(false, "Show TP1 Trim Markers", group=grp_exit)
 
 grp_trend    = "1. Trend & Baseline Settings"
 emaFastLen   = input.int(9,   "Fast EMA Length", minval=1, group=grp_trend)
@@ -92,7 +93,9 @@ showRibbon   = input.bool(true, "Show EMA Ribbon (9 / 21 / 50)", group=grp_vis)
 showEma200   = input.bool(true, "Show 200 EMA Macro Baseline", group=grp_vis)
 showTargets  = input.bool(true, "Show Active Entry / TP / SL Lines", group=grp_vis)
 showLevelLbl = input.bool(false, "Show Entry Label With SL / TP Prices", group=grp_vis)
-colorBars    = input.bool(true, "Colorize Candles By Trend Regime", group=grp_vis)
+colorBars    = input.bool(true, "Colorize Candles By Trend Regime", group=grp_vis,
+      tooltip="Green = close above 9 EMA and 9 EMA above 21 EMA (momentum up). Red = the mirror (momentum down). Gray = neutral / transition - price and the fast EMAs are not aligned.")
+grayNeutral  = input.bool(true, "Gray Out Neutral Candles", group=grp_vis, tooltip="Off = neutral candles keep the chart's native colors; only aligned candles are recolored.")
 showBgTint   = input.bool(true, "Tint Background On 200 EMA Side", group=grp_vis)
 showDash     = input.bool(true, "Show Status Dashboard", group=grp_vis)
 dashPos      = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grp_vis)
@@ -298,14 +301,18 @@ plotshape(callSignal, title="AlphaWave CALL Signal", style=shape.labelup,   loca
 plotshape(putSignal,  title="AlphaWave PUT Signal",  style=shape.labeldown, location=location.abovebar, color=color.new(#D50000, 0), text="PUT",  textcolor=color.white, size=size.normal)
 
 // Exit labels (reversals only show the new entry label to avoid clutter)
-plotshape(showTpLabels and tpCallSignal,   title="Take Profit CALL (TP CALL)", style=shape.labeldown, location=location.abovebar, color=color.new(#FFD600, 0), text="TP CALL",   textcolor=color.black, size=size.normal)
-plotshape(showTpLabels and tpPutSignal,    title="Take Profit PUT (TP PUT)",   style=shape.labelup,   location=location.belowbar, color=color.new(#FFD600, 0), text="TP PUT",    textcolor=color.black, size=size.normal)
-plotshape(showTpLabels and slCallSignal,   title="Stop Loss CALL",             style=shape.labeldown, location=location.abovebar, color=color.new(#FF6D00, 0), text="SL CALL",   textcolor=color.white, size=size.small)
-plotshape(showTpLabels and slPutSignal,    title="Stop Loss PUT",              style=shape.labelup,   location=location.belowbar, color=color.new(#FF6D00, 0), text="SL PUT",    textcolor=color.white, size=size.small)
-plotshape(showTpLabels and beCallSignal,   title="Breakeven Stop CALL",        style=shape.labeldown, location=location.abovebar, color=color.new(#FFAB40, 0), text="BE CALL",   textcolor=color.black, size=size.small)
-plotshape(showTpLabels and bePutSignal,    title="Breakeven Stop PUT",         style=shape.labelup,   location=location.belowbar, color=color.new(#FFAB40, 0), text="BE PUT",    textcolor=color.black, size=size.small)
-plotshape(showTpLabels and timeCallSignal, title="Time Exit CALL",             style=shape.labeldown, location=location.abovebar, color=color.new(#90A4AE, 0), text="EXIT CALL", textcolor=color.black, size=size.small)
-plotshape(showTpLabels and timePutSignal,  title="Time Exit PUT",              style=shape.labelup,   location=location.belowbar, color=color.new(#90A4AE, 0), text="EXIT PUT",  textcolor=color.black, size=size.small)
+bool simpleLbl   = exitLabels == "Simple (TP CALL / TP PUT)"
+bool detailedLbl = exitLabels == "Detailed (TP / SL / BE / EXIT)"
+bool simpleExitCall = simpleLbl and exitCall and exitCode != 5
+bool simpleExitPut  = simpleLbl and exitPut  and exitCode != 5
+plotshape(simpleExitCall or (detailedLbl and tpCallSignal), title="Take Profit CALL (TP CALL)", style=shape.labeldown, location=location.abovebar, color=color.new(#FFD600, 0), text="TP CALL", textcolor=color.black, size=size.normal)
+plotshape(simpleExitPut  or (detailedLbl and tpPutSignal),  title="Take Profit PUT (TP PUT)",   style=shape.labelup,   location=location.belowbar, color=color.new(#FFD600, 0), text="TP PUT",  textcolor=color.black, size=size.normal)
+plotshape(detailedLbl and slCallSignal,   title="Stop Loss CALL",      style=shape.labeldown, location=location.abovebar, color=color.new(#FF6D00, 0), text="SL CALL",   textcolor=color.white, size=size.small)
+plotshape(detailedLbl and slPutSignal,    title="Stop Loss PUT",       style=shape.labelup,   location=location.belowbar, color=color.new(#FF6D00, 0), text="SL PUT",    textcolor=color.white, size=size.small)
+plotshape(detailedLbl and beCallSignal,   title="Breakeven Stop CALL", style=shape.labeldown, location=location.abovebar, color=color.new(#FFAB40, 0), text="BE CALL",   textcolor=color.black, size=size.small)
+plotshape(detailedLbl and bePutSignal,    title="Breakeven Stop PUT",  style=shape.labelup,   location=location.belowbar, color=color.new(#FFAB40, 0), text="BE PUT",    textcolor=color.black, size=size.small)
+plotshape(detailedLbl and timeCallSignal, title="Time Exit CALL",      style=shape.labeldown, location=location.abovebar, color=color.new(#90A4AE, 0), text="EXIT CALL", textcolor=color.black, size=size.small)
+plotshape(detailedLbl and timePutSignal,  title="Time Exit PUT",       style=shape.labelup,   location=location.belowbar, color=color.new(#90A4AE, 0), text="EXIT PUT",  textcolor=color.black, size=size.small)
 plotshape(showTp1Marks and tp1CallMark,    title="TP1 Trim CALL",              style=shape.circle,    location=location.abovebar, color=color.new(#FFD600, 0), text="TP1", textcolor=color.white, size=size.tiny)
 plotshape(showTp1Marks and tp1PutMark,     title="TP1 Trim PUT",               style=shape.circle,    location=location.belowbar, color=color.new(#FFD600, 0), text="TP1", textcolor=color.white, size=size.tiny)
 
@@ -329,7 +336,7 @@ if showLevelLbl and (callSignal or putSignal)
       callSignal ? color.new(#00C853, 25) : color.new(#D50000, 25), callSignal ? label.style_label_up : label.style_label_down, color.white, size.small)
 
 // Trend bar colors
-color barColor = not colorBars ? color(na) : close > emaFast and emaFast > emaMed ? #00E676 : close < emaFast and emaFast < emaMed ? #FF5252 : #9E9E9E
+color barColor = not colorBars ? color(na) : close > emaFast and emaFast > emaMed ? #00E676 : close < emaFast and emaFast < emaMed ? #FF5252 : grayNeutral ? #9E9E9E : color(na)
 barcolor(barColor)
 
 // Background tint on 200 EMA side
