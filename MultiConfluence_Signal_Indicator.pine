@@ -1,0 +1,434 @@
+//@version=5
+indicator("AlphaWave Options Confluence Engine [CALL / PUT / TP]", shorttitle="AlphaWave Options", overlay=true, max_labels_count=200)
+
+// =============================================================================
+// ALPHAWAVE OPTIONS CONFLUENCE PRO SIGNAL ENGINE (PINE SCRIPT v5)
+// Trend Pullback + High-Volume V-Reversal / Breakout + Full Trade Lifecycle
+// (Entry -> TP1 trim / breakeven -> TP2 / SL / Momentum-fade / Time exit)
+// Compatible with: TradingView Desktop, Web, Mobile & Automated Webhooks
+//
+// Webhook contract (consumed by app.py /webhook):
+//   action : BUY_CALL | BUY_PUT | TP_CALL | TP_PUT     (TP_* = any exit)
+//   ticker : symbol,  price : fill price,  + sl / tp1 / tp2 / reason extras
+// =============================================================================
+
+// --- 1. USER INPUT CONTROLS -------------------------------------------------
+grp_strat    = "Signal Engine"
+signalMode   = input.string("All Confluence (Pullback + Volume Reversal)", "Signal Mode",
+      options=["All Confluence (Pullback + Volume Reversal)", "Value Zone Pullback Only", "Volume Breakout Reversal Only"], group=grp_strat)
+confirmClose = input.bool(true, "Evaluate Signals On Bar Close Only (Non-Repainting)", group=grp_strat,
+      tooltip="CALL / PUT / exit signals are only evaluated on the final tick of a bar, so labels never appear and disappear intrabar. Keep alerts on 'Once Per Bar Close'.")
+cooldownBars = input.int(0, "Cooldown Bars After An Exit (0 = Off)", minval=0, group=grp_strat,
+      tooltip="Minimum bars after an exit before a new CALL / PUT entry is allowed. Prevents immediate re-entry whipsaws.")
+
+grp_exit     = "Trade Lifecycle & Exits"
+useDynTp     = input.bool(true, "Momentum-Fade Exit (9 EMA Break / MACD Roll)", group=grp_exit)
+exitOnSl     = input.bool(true, "Exit When Stop Loss Is Hit", group=grp_exit)
+exitOnTp2    = input.bool(true, "Exit When TP2 (Runner) Is Hit", group=grp_exit)
+beAfterTp1   = input.bool(true, "Move Stop To Entry After TP1 Is Hit", group=grp_exit)
+maxHoldBars  = input.int(0, "Max Holding Bars - Theta Protection (0 = Off)", minval=0, group=grp_exit,
+      tooltip="Force an exit after this many bars in a trade. Useful for intraday options where theta decay dominates. 0 disables the time exit.")
+showTpLabels = input.bool(true, "Show Exit Labels (TP / SL / EXIT)", group=grp_exit)
+showTp1Marks = input.bool(true, "Show TP1 Trim Markers", group=grp_exit)
+
+grp_trend    = "1. Trend & Baseline Settings"
+emaFastLen   = input.int(9,   "Fast EMA Length", minval=1, group=grp_trend)
+emaMedLen    = input.int(21,  "Medium EMA (Value Zone) Length", minval=1, group=grp_trend)
+emaSlowLen   = input.int(50,  "Slow EMA Length", minval=1, group=grp_trend)
+emaBaseLen   = input.int(200, "Macro Baseline EMA (200) Length", minval=1, group=grp_trend)
+filter200    = input.string("Flexible (Allow Volume Reversals)", "200 EMA Filter Mode",
+      options=["Flexible (Allow Volume Reversals)", "Strict (Above/Below 200 Only)", "Disabled"], group=grp_trend)
+
+grp_htf      = "1b. Higher-Timeframe Bias Filter (Optional)"
+useHtf       = input.bool(false, "Require Higher-Timeframe EMA Alignment", group=grp_htf,
+      tooltip="CALLs only when the HTF close is above its EMA, PUTs only when below. Uses the last CLOSED HTF bar so it never repaints.")
+htfTf        = input.timeframe("60", "Higher Timeframe", group=grp_htf, tooltip="Must be higher than the chart timeframe.")
+htfEmaLen    = input.int(50, "HTF EMA Length", minval=1, group=grp_htf)
+
+grp_mom      = "2. Momentum Confirmation (RSI & MACD)"
+useRsi       = input.bool(true, "Use RSI Momentum Filter", group=grp_mom)
+rsiLen       = input.int(14, "RSI Length", minval=1, group=grp_mom)
+rsiBullBuy   = input.int(45, "RSI Bullish Threshold (CALL Pullback)", minval=20, maxval=60, group=grp_mom)
+rsiBearSell  = input.int(55, "RSI Bearish Threshold (PUT Pullback)", minval=40, maxval=80, group=grp_mom)
+boRsiCall    = input.int(46, "RSI Minimum For Breakout CALL", minval=30, maxval=70, group=grp_mom)
+boRsiPut     = input.int(54, "RSI Maximum For Breakout PUT", minval=30, maxval=70, group=grp_mom)
+useMacd      = input.bool(true, "Use MACD Momentum Filter", group=grp_mom)
+macdFast     = input.int(12, "MACD Fast Length", minval=1, group=grp_mom)
+macdSlow     = input.int(26, "MACD Slow Length", minval=1, group=grp_mom)
+macdSignal   = input.int(9,  "MACD Signal Length", minval=1, group=grp_mom)
+
+grp_regime   = "2b. Trend-Strength Regime Filter (Optional)"
+useAdx       = input.bool(false, "Require ADX Above Threshold (Skip Chop)", group=grp_regime)
+adxLen       = input.int(14, "DI Length", minval=1, group=grp_regime)
+adxSmooth    = input.int(14, "ADX Smoothing", minval=1, group=grp_regime)
+adxMin       = input.float(20, "Minimum ADX", minval=5, maxval=60, step=1, group=grp_regime)
+
+grp_vol      = "3. Volatility, Value Zone & Targets (ATR)"
+atrLen       = input.int(14, "ATR Length", minval=1, group=grp_vol)
+slAtrMult    = input.float(1.2, "Stop Loss ATR Multiplier", minval=0.3, step=0.1, group=grp_vol)
+tp1AtrMult   = input.float(1.5, "Take Profit 1 ATR (Trim 50%)", minval=0.3, step=0.1, group=grp_vol)
+tp2AtrMult   = input.float(2.5, "Take Profit 2 ATR (Close Runner)", minval=0.5, step=0.1, group=grp_vol)
+zoneMode     = input.string("Percent", "Value Zone Tolerance Mode", options=["Percent", "ATR"], group=grp_vol,
+      tooltip="Percent = fixed % bands around the 21 / 50 EMA (legacy behaviour). ATR = volatility-adaptive bands that scale across symbols and timeframes.")
+zoneTolPct   = input.float(1.2, "Zone Reach Above/Below 21 EMA (%)", minval=0, step=0.1, group=grp_vol)
+zoneDepthPct = input.float(2.5, "Max Close Beyond 50 EMA (%)", minval=0, step=0.1, group=grp_vol)
+zoneTolAtr   = input.float(0.5, "Zone Reach Above/Below 21 EMA (ATR x)", minval=0, step=0.1, group=grp_vol)
+zoneDepthAtr = input.float(1.0, "Max Close Beyond 50 EMA (ATR x)", minval=0, step=0.1, group=grp_vol)
+
+grp_volm     = "4. Institutional Volume Confirmation"
+useVolFilter = input.bool(true, "Require Volume Confirmation", group=grp_volm,
+      tooltip="Automatically bypassed on symbols that do not publish volume (e.g. SPX, VIX, FX).")
+volMaLen     = input.int(20, "Volume MA Length", minval=1, group=grp_volm)
+volMult      = input.float(0.80, "Pullback Volume Factor", minval=0.1, step=0.05, group=grp_volm)
+volBreakMult = input.float(1.10, "Breakout Volume Surge Factor", minval=0.5, step=0.05, group=grp_volm)
+
+grp_sess     = "4b. Session Filter (Intraday Only)"
+useSession   = input.bool(false, "Only Signal Inside Session", group=grp_sess,
+      tooltip="Intraday charts only. Example: 0945-1545 skips the opening and closing 15 minutes. Uses the exchange time zone.")
+sessionStr   = input.session("0930-1600", "Session (Exchange Time)", group=grp_sess)
+
+grp_vis      = "5. Chart Aesthetics & Displays"
+showRibbon   = input.bool(true, "Show EMA Ribbon (9 / 21 / 50)", group=grp_vis)
+showEma200   = input.bool(true, "Show 200 EMA Macro Baseline", group=grp_vis)
+showTargets  = input.bool(true, "Show Active Entry / TP / SL Lines", group=grp_vis)
+showLevelLbl = input.bool(false, "Show Entry Label With SL / TP Prices", group=grp_vis)
+colorBars    = input.bool(true, "Colorize Candles By Trend Regime", group=grp_vis)
+showBgTint   = input.bool(true, "Tint Background On 200 EMA Side", group=grp_vis)
+showDash     = input.bool(true, "Show Status Dashboard", group=grp_vis)
+dashPos      = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grp_vis)
+
+grp_alert    = "6. Alerts"
+useAlertFn   = input.bool(true, "Send Dynamic JSON via alert() (Any alert() function call)", group=grp_alert,
+      tooltip="Rich JSON alerts with engine, reason, SL / TP and P&L. Create ONE alert on this indicator with condition 'Any alert() function call'. Turn off if you use the classic per-condition alerts, to avoid duplicates.")
+alertTp1     = input.bool(false, "Also Send TP1 Trim Events via alert()", group=grp_alert,
+      tooltip="Off by default: the AlphaWave dashboard treats any action containing 'TP' as a full exit, so only enable this for consumers that understand TP1_TRIM_* events.")
+
+// --- 2. INDICATOR CORE CALCULATIONS ---------------------------------------
+emaFast = ta.ema(close, emaFastLen)
+emaMed  = ta.ema(close, emaMedLen)
+emaSlow = ta.ema(close, emaSlowLen)
+emaBase = ta.ema(close, emaBaseLen)
+
+rsiVal  = ta.rsi(close, rsiLen)
+[macdLine, signalLine, histLine] = ta.macd(close, macdFast, macdSlow, macdSignal)
+atrVal  = ta.atr(atrLen)
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxSmooth)
+
+// Volume (gracefully degrades on symbols with no volume feed)
+volMa      = ta.sma(volume, volMaLen)
+hasVolume  = not na(volume) and not na(volMa) and volMa > 0
+volOkPull  = not useVolFilter or not hasVolume or volume >= volMa * volMult
+volOkBreak = not useVolFilter or not hasVolume or volume >= volMa * volBreakMult
+
+// Higher-timeframe bias (last CLOSED HTF bar -> no repaint)
+htfEma    = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen)[1], lookahead=barmerge.lookahead_on)
+htfClose  = request.security(syminfo.tickerid, htfTf, close[1], lookahead=barmerge.lookahead_on)
+htfBull   = htfClose > htfEma
+htfBear   = htfClose < htfEma
+htfOkCall = not useHtf or htfBull
+htfOkPut  = not useHtf or htfBear
+
+// Session / regime / confirmation gates
+inSession = not useSession or not timeframe.isintraday or not na(time(timeframe.period, sessionStr, syminfo.timezone))
+adxOk     = not useAdx or adxVal >= adxMin
+barOk     = not confirmClose or barstate.isconfirmed
+gateOk    = inSession and adxOk and barOk
+
+// Cross events (computed unconditionally every bar so their history is stable)
+rsiBullTurn    = ta.crossover(rsiVal, rsiBullBuy)
+rsiBearTurn    = ta.crossunder(rsiVal, rsiBearSell)
+macdBullTurn   = ta.crossover(histLine, 0)
+macdBearTurn   = ta.crossunder(histLine, 0)
+closeOverFast  = ta.crossover(close, emaFast)
+closeUnderFast = ta.crossunder(close, emaFast)
+
+// --- 3. DUAL-ENGINE CONFLUENCE EVALUATION ---------------------------------
+strict200   = filter200 == "Strict (Above/Below 200 Only)"
+pass200Call = not strict200 or close > emaBase
+pass200Put  = not strict200 or close < emaBase
+
+// Engine A: Trend Pullback into the 21 / 50 EMA value zone
+bullTrend = (strict200 ? close > emaBase : close > emaSlow) and emaMed > emaSlow
+bearTrend = (strict200 ? close < emaBase : close < emaSlow) and emaMed < emaSlow
+
+zoneReach = zoneMode == "ATR" ? atrVal * zoneTolAtr   : emaMed  * zoneTolPct   / 100
+zoneDepth = zoneMode == "ATR" ? atrVal * zoneDepthAtr : emaSlow * zoneDepthPct / 100
+bullDip   = low  <= emaMed + zoneReach and close >= emaSlow - zoneDepth
+bearRally = high >= emaMed - zoneReach and close <= emaSlow + zoneDepth
+
+noMomFilter = not useRsi and not useMacd
+bullTrigger = noMomFilter or (useRsi and rsiBullTurn) or (useMacd and macdBullTurn)
+bearTrigger = noMomFilter or (useRsi and rsiBearTurn) or (useMacd and macdBearTurn)
+
+pullbackCall = bullTrend and bullDip   and bullTrigger and volOkPull and pass200Call
+pullbackPut  = bearTrend and bearRally and bearTrigger and volOkPull and pass200Put
+
+// Engine B: Institutional Volume Breakout / V-Reversal emerging through the 9 & 21 EMA
+wasBelowCall = close[1] <= emaFast[1] or close[1] <= emaMed[1] or open <= emaFast or open <= emaMed
+wasAbovePut  = close[1] >= emaFast[1] or close[1] >= emaMed[1] or open >= emaFast or open >= emaMed
+boMacdCall   = not useMacd or (histLine > 0 and histLine > histLine[1])
+boMacdPut    = not useMacd or (histLine < 0 and histLine < histLine[1])
+boRsiOkCall  = not useRsi or rsiVal >= boRsiCall
+boRsiOkPut   = not useRsi or rsiVal <= boRsiPut
+
+breakoutCall = wasBelowCall and close > emaFast and close > emaMed and close > open and volOkBreak and boMacdCall and boRsiOkCall and pass200Call
+breakoutPut  = wasAbovePut  and close < emaFast and close < emaMed and close < open and volOkBreak and boMacdPut  and boRsiOkPut  and pass200Put
+
+// Combine per Signal Mode
+modeCall = signalMode == "Value Zone Pullback Only" ? pullbackCall : signalMode == "Volume Breakout Reversal Only" ? breakoutCall : (pullbackCall or breakoutCall)
+modePut  = signalMode == "Value Zone Pullback Only" ? pullbackPut  : signalMode == "Volume Breakout Reversal Only" ? breakoutPut  : (pullbackPut  or breakoutPut)
+
+rawCallPre = gateOk and htfOkCall and modeCall
+rawPutPre  = gateOk and htfOkPut  and modePut
+conflict   = rawCallPre and rawPutPre          // opposing engines on the same bar = no confluence
+rawCall    = rawCallPre and not conflict
+rawPut     = rawPutPre  and not conflict
+
+// --- 4. TRADE LIFECYCLE STATE MACHINE -------------------------------------
+var int    posDir      = 0        // 1 = CALL, -1 = PUT, 0 = FLAT
+var float  entryPx     = na
+var float  slLevel     = na
+var float  tp1Level    = na
+var float  tp2Level    = na
+var bool   tp1Done     = false
+var int    entryBar    = na
+var int    lastExitBar = na
+var string engineUsed  = ""
+
+bool inCall     = posDir == 1
+bool inPut      = posDir == -1
+bool afterEntry = barOk and not na(entryBar) and bar_index > entryBar   // exits honour the same bar-close gate as entries
+
+// Exit events against the position carried into this bar (SL takes precedence on a bar that touches both)
+bool callSlHit  = inCall and afterEntry and exitOnSl  and low  <= slLevel
+bool callTp1Hit = inCall and afterEntry and not tp1Done and high >= tp1Level
+bool callTp2Hit = inCall and afterEntry and exitOnTp2 and high >= tp2Level
+bool callDynTp  = inCall and afterEntry and useDynTp  and (closeUnderFast or macdBearTurn)
+bool callTimeUp = inCall and afterEntry and maxHoldBars > 0 and bar_index - entryBar >= maxHoldBars
+
+bool putSlHit   = inPut and afterEntry and exitOnSl  and high >= slLevel
+bool putTp1Hit  = inPut and afterEntry and not tp1Done and low <= tp1Level
+bool putTp2Hit  = inPut and afterEntry and exitOnTp2 and low  <= tp2Level
+bool putDynTp   = inPut and afterEntry and useDynTp  and (closeOverFast or macdBullTurn)
+bool putTimeUp  = inPut and afterEntry and maxHoldBars > 0 and bar_index - entryBar >= maxHoldBars
+
+// Exit codes: 1 = Momentum fade, 2 = TP2 target, 3 = Stop loss, 4 = Time, 5 = Reversal, 6 = Breakeven stop (after TP1)
+int callExitCode = callSlHit ? (tp1Done ? 6 : 3) : callTp2Hit ? 2 : callDynTp ? 1 : callTimeUp ? 4 : 0
+int putExitCode  = putSlHit  ? (tp1Done ? 6 : 3) : putTp2Hit  ? 2 : putDynTp  ? 1 : putTimeUp  ? 4 : 0
+
+// Entry candidates (a signal against an open position is a reversal)
+bool cooldownOk = cooldownBars == 0 or na(lastExitBar) or bar_index - lastExitBar >= cooldownBars
+bool callSignal = rawCall and not inCall and cooldownOk
+bool putSignal  = rawPut  and not inPut  and cooldownOk
+
+bool exitCall = inCall and (callExitCode > 0 or putSignal)
+bool exitPut  = inPut  and (putExitCode  > 0 or callSignal)
+int  exitCode = exitCall ? (callExitCode > 0 ? callExitCode : 5) : exitPut ? (putExitCode > 0 ? putExitCode : 5) : 0
+
+// Exit fill price (gap-aware for stops / targets) and realised P&L
+float exitPx = na
+bool stopExit = exitCode == 3 or exitCode == 6
+if exitCall
+    exitPx := stopExit ? math.min(open, slLevel) : exitCode == 2 ? math.max(open, tp2Level) : close
+if exitPut
+    exitPx := stopExit ? math.max(open, slLevel) : exitCode == 2 ? math.min(open, tp2Level) : close
+
+float exitPnlPct = na
+if exitCall
+    exitPnlPct := (exitPx - entryPx) / entryPx * 100
+if exitPut
+    exitPnlPct := (entryPx - exitPx) / entryPx * 100
+string exitEngine = engineUsed
+
+// TP1 trim marker (suppressed when the same bar stops out or completes at TP2)
+bool tp1CallMark = callTp1Hit and not callSlHit and not callTp2Hit
+bool tp1PutMark  = putTp1Hit  and not putSlHit  and not putTp2Hit
+if callTp1Hit or putTp1Hit
+    tp1Done := true
+    if beAfterTp1 and not exitCall and not exitPut
+        slLevel := entryPx
+
+// Apply exits, then entries (so reversals flip cleanly on one bar)
+if exitCall or exitPut
+    posDir      := 0
+    lastExitBar := bar_index
+    entryBar    := na
+
+if callSignal
+    posDir     := 1
+    entryPx    := close
+    entryBar   := bar_index
+    tp1Done    := false
+    engineUsed := pullbackCall ? "PULLBACK" : "BREAKOUT"
+    slLevel    := close - atrVal * slAtrMult
+    tp1Level   := close + atrVal * tp1AtrMult
+    tp2Level   := close + atrVal * tp2AtrMult
+
+if putSignal
+    posDir     := -1
+    entryPx    := close
+    entryBar   := bar_index
+    tp1Done    := false
+    engineUsed := pullbackPut ? "PULLBACK" : "BREAKOUT"
+    slLevel    := close + atrVal * slAtrMult
+    tp1Level   := close - atrVal * tp1AtrMult
+    tp2Level   := close - atrVal * tp2AtrMult
+
+// Display flags
+bool tpCallSignal   = exitCall and (exitCode == 1 or exitCode == 2)
+bool tpPutSignal    = exitPut  and (exitCode == 1 or exitCode == 2)
+bool slCallSignal   = exitCall and exitCode == 3
+bool slPutSignal    = exitPut  and exitCode == 3
+bool beCallSignal   = exitCall and exitCode == 6
+bool bePutSignal    = exitPut  and exitCode == 6
+bool timeCallSignal = exitCall and exitCode == 4
+bool timePutSignal  = exitPut  and exitCode == 4
+
+float openPnlPct = posDir == 1 ? (close - entryPx) / entryPx * 100 : posDir == -1 ? (entryPx - close) / entryPx * 100 : na
+
+// --- 5. VISUAL CHART PLOTTING ---------------------------------------------
+plot(emaFast, title="Fast EMA (9)",             color=color.new(#00E676, 20), linewidth=1, display=showRibbon ? display.all : display.none)
+plot(emaMed,  title="Medium EMA (21)",          color=color.new(#FFD600, 20), linewidth=2, display=showRibbon ? display.all : display.none)
+plot(emaSlow, title="Slow EMA (50)",            color=color.new(#FF9100, 30), linewidth=2, display=showRibbon ? display.all : display.none)
+plot(emaBase, title="Macro Baseline (200 EMA)", color=color.new(#2979FF, 0),  linewidth=3, display=showEma200 ? display.all : display.none)
+plot(htfEma,  title="HTF EMA Bias",             color=color.new(#B388FF, 30), linewidth=1, style=plot.style_circles, display=useHtf ? display.all : display.none)
+
+// Entry labels
+plotshape(callSignal, title="AlphaWave CALL Signal", style=shape.labelup,   location=location.belowbar, color=color.new(#00C853, 0), text="CALL", textcolor=color.white, size=size.normal)
+plotshape(putSignal,  title="AlphaWave PUT Signal",  style=shape.labeldown, location=location.abovebar, color=color.new(#D50000, 0), text="PUT",  textcolor=color.white, size=size.normal)
+
+// Exit labels (reversals only show the new entry label to avoid clutter)
+plotshape(showTpLabels and tpCallSignal,   title="Take Profit CALL (TP CALL)", style=shape.labeldown, location=location.abovebar, color=color.new(#FFD600, 0), text="TP CALL",   textcolor=color.black, size=size.normal)
+plotshape(showTpLabels and tpPutSignal,    title="Take Profit PUT (TP PUT)",   style=shape.labelup,   location=location.belowbar, color=color.new(#FFD600, 0), text="TP PUT",    textcolor=color.black, size=size.normal)
+plotshape(showTpLabels and slCallSignal,   title="Stop Loss CALL",             style=shape.labeldown, location=location.abovebar, color=color.new(#FF6D00, 0), text="SL CALL",   textcolor=color.white, size=size.small)
+plotshape(showTpLabels and slPutSignal,    title="Stop Loss PUT",              style=shape.labelup,   location=location.belowbar, color=color.new(#FF6D00, 0), text="SL PUT",    textcolor=color.white, size=size.small)
+plotshape(showTpLabels and beCallSignal,   title="Breakeven Stop CALL",        style=shape.labeldown, location=location.abovebar, color=color.new(#FFAB40, 0), text="BE CALL",   textcolor=color.black, size=size.small)
+plotshape(showTpLabels and bePutSignal,    title="Breakeven Stop PUT",         style=shape.labelup,   location=location.belowbar, color=color.new(#FFAB40, 0), text="BE PUT",    textcolor=color.black, size=size.small)
+plotshape(showTpLabels and timeCallSignal, title="Time Exit CALL",             style=shape.labeldown, location=location.abovebar, color=color.new(#90A4AE, 0), text="EXIT CALL", textcolor=color.black, size=size.small)
+plotshape(showTpLabels and timePutSignal,  title="Time Exit PUT",              style=shape.labelup,   location=location.belowbar, color=color.new(#90A4AE, 0), text="EXIT PUT",  textcolor=color.black, size=size.small)
+plotshape(showTp1Marks and tp1CallMark,    title="TP1 Trim CALL",              style=shape.circle,    location=location.abovebar, color=color.new(#FFD600, 0), text="TP1", textcolor=color.white, size=size.tiny)
+plotshape(showTp1Marks and tp1PutMark,     title="TP1 Trim PUT",               style=shape.circle,    location=location.belowbar, color=color.new(#FFD600, 0), text="TP1", textcolor=color.white, size=size.tiny)
+
+// Active target lines (always computed so alert placeholders resolve even when hidden)
+bool showLines = posDir != 0
+plot(showLines ? slLevel  : na, title="Stop Loss Level",     color=color.new(#FF1744, 20), style=plot.style_linebr, linewidth=2, display=showTargets ? display.all : display.none)
+plot(showLines ? tp1Level : na, title="TP1 Target (Trim)",   color=color.new(#00E676, 40), style=plot.style_linebr, linewidth=1, display=showTargets ? display.all : display.none)
+plot(showLines ? tp2Level : na, title="TP2 Target (Runner)", color=color.new(#00C853, 20), style=plot.style_linebr, linewidth=2, display=showTargets ? display.all : display.none)
+plot(showLines ? entryPx  : na, title="Entry Price",         color=color.new(#FFFFFF, 60), style=plot.style_linebr, linewidth=1, display=showTargets ? display.all : display.none)
+
+// Data-window-only plots used by alert placeholders
+plot(exitCode,   title="Exit Code",          display=display.data_window)
+plot(exitPx,     title="Exit Price",         display=display.data_window)
+plot(exitPnlPct, title="Exit PnL Pct",       display=display.data_window)
+plot(posDir,     title="Position Direction", display=display.data_window)
+
+// Optional detailed entry label with price levels
+if showLevelLbl and (callSignal or putSignal)
+    string lvlTxt = (callSignal ? "CALL " : "PUT ") + engineUsed + "\nEntry " + str.tostring(close, format.mintick) + "\nSL  " + str.tostring(slLevel, format.mintick) + "\nTP1 " + str.tostring(tp1Level, format.mintick) + "\nTP2 " + str.tostring(tp2Level, format.mintick)
+    label.new(bar_index, callSignal ? low : high, lvlTxt, xloc.bar_index, callSignal ? yloc.belowbar : yloc.abovebar,
+      callSignal ? color.new(#00C853, 25) : color.new(#D50000, 25), callSignal ? label.style_label_up : label.style_label_down, color.white, size.small)
+
+// Trend bar colors
+color barColor = not colorBars ? color(na) : close > emaFast and emaFast > emaMed ? #00E676 : close < emaFast and emaFast < emaMed ? #FF5252 : #9E9E9E
+barcolor(barColor)
+
+// Background tint on 200 EMA side
+bgcolor(showBgTint ? (close > emaBase ? color.new(#00E676, 95) : close < emaBase ? color.new(#FF1744, 95) : color(na)) : color(na))
+
+// --- 6. STATUS DASHBOARD ---------------------------------------------------
+var table dash = table.new(dashPos == "Top Right" ? position.top_right : dashPos == "Top Left" ? position.top_left : dashPos == "Bottom Right" ? position.bottom_right : position.bottom_left,
+      2, 13, bgcolor=color.new(#0D1117, 15), border_width=1, border_color=color.new(#FFFFFF, 85))
+
+f_cell(int col, int row, string txt, color txtCol) =>
+    table.cell(dash, col, row, txt, text_color=txtCol, bgcolor=color.new(#0D1117, 15), text_size=size.small, text_halign=text.align_left)
+
+if showDash and barstate.islast
+    color cHead = color.new(#FFFFFF, 0)
+    color cBull = color.new(#00C853, 0)
+    color cBear = color.new(#D50000, 0)
+    color cNeut = color.new(#9E9E9E, 0)
+    color cGold = color.new(#FFD600, 0)
+
+    string regime    = bullTrend ? "BULLISH" : bearTrend ? "BEARISH" : "NEUTRAL"
+    color  regimeCol = bullTrend ? cBull : bearTrend ? cBear : cNeut
+    string htfTxt    = useHtf ? (htfBull ? "BULL" : htfBear ? "BEAR" : "FLAT") : "OFF"
+    color  htfCol    = htfTxt == "BULL" ? cBull : htfTxt == "BEAR" ? cBear : cNeut
+    string adxTxt    = str.tostring(adxVal, "#.#") + (useAdx ? (adxOk ? "  OK" : "  CHOP") : "")
+    string volTxt    = not hasVolume ? "N/A" : str.tostring(volume / volMa * 100, "#") + "% of MA"
+    string posTxt    = posDir == 1 ? "CALL" : posDir == -1 ? "PUT" : "FLAT"
+    color  posCol    = posDir == 1 ? cBull : posDir == -1 ? cBear : cNeut
+    string barsIn    = posDir != 0 and not na(entryBar) ? "  (" + str.tostring(bar_index - entryBar) + " bars)" : ""
+    string sessTxt   = useSession ? (inSession ? "IN" : "OUT") : "OFF"
+    string lvlTxt    = posDir == 0 ? "-" : str.tostring(entryPx, format.mintick) + " / " + str.tostring(slLevel, format.mintick) + (tp1Done ? " (BE)" : "")
+    string tgtTxt    = posDir == 0 ? "-" : str.tostring(tp1Level, format.mintick) + " / " + str.tostring(tp2Level, format.mintick) + " / " + str.tostring(openPnlPct, "#.##") + "%"
+    color  pnlCol    = posDir == 0 ? cHead : openPnlPct >= 0 ? cBull : cBear
+
+    f_cell(0, 0,  "AlphaWave " + timeframe.period, cGold)
+    f_cell(1, 0,  syminfo.ticker, cGold)
+    f_cell(0, 1,  "Regime", cHead)
+    f_cell(1, 1,  regime, regimeCol)
+    f_cell(0, 2,  "200 EMA", cHead)
+    f_cell(1, 2,  close > emaBase ? "ABOVE" : "BELOW", close > emaBase ? cBull : cBear)
+    f_cell(0, 3,  "HTF Bias", cHead)
+    f_cell(1, 3,  htfTxt, htfCol)
+    f_cell(0, 4,  "RSI " + str.tostring(rsiLen), cHead)
+    f_cell(1, 4,  str.tostring(rsiVal, "#.#"), rsiVal >= 50 ? cBull : cBear)
+    f_cell(0, 5,  "MACD Hist", cHead)
+    f_cell(1, 5,  str.tostring(histLine, "#.###"), histLine >= 0 ? cBull : cBear)
+    f_cell(0, 6,  "ADX", cHead)
+    f_cell(1, 6,  adxTxt, adxOk ? cHead : cNeut)
+    f_cell(0, 7,  "Volume", cHead)
+    f_cell(1, 7,  volTxt, cHead)
+    f_cell(0, 8,  "ATR", cHead)
+    f_cell(1, 8,  str.tostring(atrVal, format.mintick), cHead)
+    f_cell(0, 9,  "Session", cHead)
+    f_cell(1, 9,  sessTxt, sessTxt == "OUT" ? cNeut : cHead)
+    f_cell(0, 10, "Position", cHead)
+    f_cell(1, 10, posTxt + barsIn, posCol)
+    f_cell(0, 11, "Entry / SL", cHead)
+    f_cell(1, 11, lvlTxt, cHead)
+    f_cell(0, 12, "TP1 / TP2 / P&L", cHead)
+    f_cell(1, 12, tgtTxt, pnlCol)
+
+// --- 7. ALERTS & WEBHOOK PAYLOADS -----------------------------------------
+// Classic per-condition alerts. Placeholders reference plots BY TITLE (robust to plot ordering).
+alertcondition(callSignal, title="AlphaWave CALL Alert",
+      message='{"action": "BUY_CALL", "ticker": "{{ticker}}", "tf": "{{interval}}", "price": {{close}}, "sl": {{plot("Stop Loss Level")}}, "tp1": {{plot("TP1 Target (Trim)")}}, "tp2": {{plot("TP2 Target (Runner)")}}, "time": "{{timenow}}"}')
+
+alertcondition(putSignal, title="AlphaWave PUT Alert",
+      message='{"action": "BUY_PUT", "ticker": "{{ticker}}", "tf": "{{interval}}", "price": {{close}}, "sl": {{plot("Stop Loss Level")}}, "tp1": {{plot("TP1 Target (Trim)")}}, "tp2": {{plot("TP2 Target (Runner)")}}, "time": "{{timenow}}"}')
+
+alertcondition(exitCall, title="CALL Exit Alert (TP / SL / Time / Reversal)",
+      message='{"action": "TP_CALL", "ticker": "{{ticker}}", "tf": "{{interval}}", "price": {{plot("Exit Price")}}, "exit_code": {{plot("Exit Code")}}, "pnl_pct": {{plot("Exit PnL Pct")}}, "time": "{{timenow}}"}')
+
+alertcondition(exitPut, title="PUT Exit Alert (TP / SL / Time / Reversal)",
+      message='{"action": "TP_PUT", "ticker": "{{ticker}}", "tf": "{{interval}}", "price": {{plot("Exit Price")}}, "exit_code": {{plot("Exit Code")}}, "pnl_pct": {{plot("Exit PnL Pct")}}, "time": "{{timenow}}"}')
+
+// Dynamic JSON alerts: a single "Any alert() function call" alert covers every event
+f_num(float v) =>
+    na(v) ? "null" : str.tostring(v, format.mintick)
+
+f_reason(int code) =>
+    code == 1 ? "MOMENTUM_FADE" : code == 2 ? "TP2_TARGET" : code == 3 ? "STOP_LOSS" : code == 4 ? "TIME_EXIT" : code == 5 ? "REVERSAL" : code == 6 ? "BREAKEVEN_STOP" : "ENTRY"
+
+f_json(string action, string engine, string reason, float px, float sl, float tp1, float tp2, float pnl) =>
+    '{"action": "' + action + '", "ticker": "' + syminfo.ticker + '", "exchange": "' + syminfo.prefix + '", "tf": "' + timeframe.period +
+      '", "engine": "' + engine + '", "reason": "' + reason + '", "price": ' + f_num(px) +
+      ', "sl": ' + f_num(sl) + ', "tp1": ' + f_num(tp1) + ', "tp2": ' + f_num(tp2) +
+      ', "pnl_pct": ' + (na(pnl) ? "null" : str.tostring(pnl, "#.##")) + ', "atr": ' + f_num(atrVal) + ', "rsi": ' + str.tostring(rsiVal, "#.#") +
+      ', "time": "' + str.format_time(time_close, "yyyy-MM-dd HH:mm:ss", syminfo.timezone) + '"}'
+
+if useAlertFn
+    // Exits are sent before entries so a reversal arrives as TP_x followed by BUY_y
+    if exitCall
+        alert(f_json("TP_CALL", exitEngine, f_reason(exitCode), exitPx, float(na), float(na), float(na), exitPnlPct), alert.freq_once_per_bar_close)
+    if exitPut
+        alert(f_json("TP_PUT", exitEngine, f_reason(exitCode), exitPx, float(na), float(na), float(na), exitPnlPct), alert.freq_once_per_bar_close)
+    if callSignal
+        alert(f_json("BUY_CALL", engineUsed, "ENTRY", close, slLevel, tp1Level, tp2Level, float(na)), alert.freq_once_per_bar_close)
+    if putSignal
+        alert(f_json("BUY_PUT", engineUsed, "ENTRY", close, slLevel, tp1Level, tp2Level, float(na)), alert.freq_once_per_bar_close)
+    if alertTp1 and tp1CallMark
+        alert('{"action": "TP1_TRIM_CALL", "ticker": "' + syminfo.ticker + '", "tf": "' + timeframe.period + '", "price": ' + f_num(tp1Level) + ', "new_sl": ' + f_num(slLevel) + '}', alert.freq_once_per_bar_close)
+    if alertTp1 and tp1PutMark
+        alert('{"action": "TP1_TRIM_PUT", "ticker": "' + syminfo.ticker + '", "tf": "' + timeframe.period + '", "price": ' + f_num(tp1Level) + ', "new_sl": ' + f_num(slLevel) + '}', alert.freq_once_per_bar_close)

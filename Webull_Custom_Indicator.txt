@@ -1,0 +1,234 @@
+import { CustomIndicator, Bar, Color, PlotHandle, PlotType, CustomIndicatorOptions } from 'metrix';
+
+// =============================================================================
+// ALPHAWAVE OPTIONS CONFLUENCE PRO ENGINE FOR WEBULL DESKTOP
+// Multi-Confluence: Trend Pullback + Institutional Volume Reversal + Dynamic TP
+// =============================================================================
+
+class AlphaWaveOptions extends CustomIndicator {
+    // Plots: Moving Average Ribbon
+    private ema9Plot: PlotHandle;
+    private ema21Plot: PlotHandle;
+    private ema50Plot: PlotHandle;
+    private ema200Plot: PlotHandle;
+
+    // Plots: Dynamic Risk & Profit Target Lines
+    private stopLossPlot: PlotHandle;
+    private takeProfitPlot: PlotHandle;
+
+    // Plots: Execution Signals
+    private callPlot: PlotHandle;
+    private putPlot: PlotHandle;
+    private tpCallPlot: PlotHandle;
+    private tpPutPlot: PlotHandle;
+
+    // State Variables
+    private ema9Val: number = 0;
+    private ema21Val: number = 0;
+    private ema50Val: number = 0;
+    private ema200Val: number = 0;
+
+    private ema12Val: number = 0;
+    private ema26Val: number = 0;
+    private macdSigVal: number = 0;
+    private prevHist: number = 0;
+
+    private avgGain: number = 0;
+    private avgLoss: number = 0;
+    private prevClose: number = 0;
+    private prevRsi: number = 50;
+
+    private atrVal: number = 0;
+    private activeSl: number = 0;
+    private activeTp: number = 0;
+
+    private inCall: boolean = false;
+    private inPut: boolean = false;
+    private barCount: number = 0;
+
+    // Volume moving average
+    private volMaVal: number = 0;
+
+    constructor(options: CustomIndicatorOptions) {
+        super(options);
+        // Register Indicator on Main Price Overlay
+        this.defineIndicator('AlphaWave Options Pro', 'AWO', true);
+
+        // 1. Trend Ribbon Plots (Continuous lines on chart)
+        this.ema9Plot = this.definePlot('EMA 9 (Fast)', { color: Color.Green, type: PlotType.Line, lineWidth: 1 });
+        this.ema21Plot = this.definePlot('EMA 21 (Pullback Zone)', { color: Color.Yellow, type: PlotType.Line, lineWidth: 2 });
+        this.ema50Plot = this.definePlot('EMA 50 (Trend Baseline)', { color: Color.Orange, type: PlotType.Line, lineWidth: 2 });
+        this.ema200Plot = this.definePlot('EMA 200 (Macro Trend)', { color: Color.Blue, type: PlotType.Line, lineWidth: 3 });
+
+        // 2. Active Targets (Dynamic Trailing Levels)
+        this.stopLossPlot = this.definePlot('Stop Loss Level', { color: Color.Red, type: PlotType.Line, lineWidth: 2 });
+        this.takeProfitPlot = this.definePlot('Take Profit Target', { color: Color.Green, type: PlotType.Line, lineWidth: 2 });
+
+        // 3. Trade Entry & Take Profit Signal Dots
+        this.callPlot = this.definePlot('CALL Entry', { color: Color.Green, type: PlotType.Circles, lineWidth: 6 });
+        this.putPlot = this.definePlot('PUT Entry', { color: Color.Red, type: PlotType.Circles, lineWidth: 6 });
+        this.tpCallPlot = this.definePlot('TP CALL Exit', { color: Color.Yellow, type: PlotType.Circles, lineWidth: 6 });
+        this.tpPutPlot = this.definePlot('TP PUT Exit', { color: Color.Yellow, type: PlotType.Circles, lineWidth: 6 });
+    }
+
+    onBar(bar: Bar): void {
+        const c = bar.close;
+        const o = bar.open;
+        const h = bar.high;
+        const l = bar.low;
+        const v = bar.volume;
+        this.barCount++;
+
+        // Track Volume MA (20 period)
+        const kVol = 2 / (20 + 1);
+        if (this.barCount === 1) {
+            this.volMaVal = v;
+        } else {
+            this.volMaVal = v * kVol + this.volMaVal * (1 - kVol);
+        }
+        const volMa = this.volMaVal;
+
+        if (this.barCount === 1) {
+            this.ema9Val = c;
+            this.ema21Val = c;
+            this.ema50Val = c;
+            this.ema200Val = c;
+            this.ema12Val = c;
+            this.ema26Val = c;
+            this.prevClose = c;
+            this.atrVal = h - l;
+
+            // Plot bar 1 so data series aligns from the start
+            this.ema9Plot(this.ema9Val);
+            this.ema21Plot(this.ema21Val);
+            this.ema50Plot(this.ema50Val);
+            this.ema200Plot(this.ema200Val);
+            this.stopLossPlot(NaN);
+            this.takeProfitPlot(NaN);
+            this.callPlot(NaN);
+            this.putPlot(NaN);
+            this.tpCallPlot(NaN);
+            this.tpPutPlot(NaN);
+            return;
+        }
+
+        // Multi-EMA Multipliers
+        const k9 = 2 / (9 + 1);
+        const k21 = 2 / (21 + 1);
+        const k50 = 2 / (50 + 1);
+        const k200 = 2 / (200 + 1);
+        const k12 = 2 / (12 + 1);
+        const k26 = 2 / (26 + 1);
+        const kSig = 2 / (9 + 1);
+
+        // Calculate EMAs
+        this.ema9Val = c * k9 + this.ema9Val * (1 - k9);
+        this.ema21Val = c * k21 + this.ema21Val * (1 - k21);
+        this.ema50Val = c * k50 + this.ema50Val * (1 - k50);
+        this.ema200Val = c * k200 + this.ema200Val * (1 - k200);
+
+        // MACD (12, 26, 9)
+        this.ema12Val = c * k12 + this.ema12Val * (1 - k12);
+        this.ema26Val = c * k26 + this.ema26Val * (1 - k26);
+        const macdLine = this.ema12Val - this.ema26Val;
+        this.macdSigVal = macdLine * kSig + this.macdSigVal * (1 - kSig);
+        const macdHist = macdLine - this.macdSigVal;
+
+        // RSI (14)
+        const diff = c - this.prevClose;
+        const gain = diff > 0 ? diff : 0;
+        const loss = diff < 0 ? -diff : 0;
+
+        if (this.barCount <= 14) {
+            this.avgGain += gain / 14;
+            this.avgLoss += loss / 14;
+        } else {
+            this.avgGain = (this.avgGain * 13 + gain) / 14;
+            this.avgLoss = (this.avgLoss * 13 + loss) / 14;
+        }
+
+        const rs = this.avgLoss === 0 ? 100 : this.avgGain / this.avgLoss;
+        const rsi = 100 - (100 / (1 + rs));
+
+        // ATR (14)
+        const tr = Math.max(h - l, Math.abs(h - this.prevClose), Math.abs(l - this.prevClose));
+        if (this.barCount <= 14) {
+            this.atrVal += tr / 14;
+        } else {
+            this.atrVal = (this.atrVal * 13 + tr) / 14;
+        }
+
+        // =====================================================================
+        // DUAL-ENGINE CONFLUENCE EVALUATION
+        // =====================================================================
+
+        // Engine 1: Trend Pullback Setup
+        const bullTrend = (c > this.ema50Val) && (this.ema21Val > this.ema50Val);
+        const bearTrend = (c < this.ema50Val) && (this.ema21Val < this.ema50Val);
+
+        const bullDip = (l <= this.ema21Val * 1.01) && (c >= this.ema50Val * 0.98);
+        const bearRally = (h >= this.ema21Val * 0.99) && (c <= this.ema50Val * 1.02);
+
+        const pullbackCall = bullTrend && bullDip && (rsi > 45 || macdHist > 0) && (v >= volMa * 0.80);
+        const pullbackPut = bearTrend && bearRally && (rsi < 55 || macdHist < 0) && (v >= volMa * 0.80);
+
+        // Engine 2: Institutional Volume Breakout & V-Bottom Reversal (Emerging from below EMAs)
+        const wasBelowOrCrossingCall = (this.prevClose <= this.ema9Val) || (this.prevClose <= this.ema21Val) || (o <= this.ema9Val) || (o <= this.ema21Val);
+        const breakoutCall = wasBelowOrCrossingCall && (c > this.ema9Val) && (c > this.ema21Val) && (c > o) &&
+                             (v >= volMa * 1.1) && (macdHist > 0) && (rsi >= 46) &&
+                             (macdHist > this.prevHist);
+
+        const wasAboveOrCrossingPut = (this.prevClose >= this.ema9Val) || (this.prevClose >= this.ema21Val) || (o >= this.ema9Val) || (o >= this.ema21Val);
+        const breakoutPut = wasAboveOrCrossingPut && (c < this.ema9Val) && (c < this.ema21Val) && (c < o) &&
+                            (v >= volMa * 1.1) && (macdHist < 0) && (rsi <= 54) &&
+                            (macdHist < this.prevHist);
+
+        // Combined Entry Signals
+        const callSignal = (pullbackCall || breakoutCall) && !this.inCall;
+        const putSignal = (pullbackPut || breakoutPut) && !this.inPut;
+
+        if (callSignal) {
+            this.inCall = true;
+            this.inPut = false;
+            this.activeSl = c - (this.atrVal * 1.2);
+            this.activeTp = c + (this.atrVal * 2.0);
+        }
+        if (putSignal) {
+            this.inPut = true;
+            this.inCall = false;
+            this.activeSl = c + (this.atrVal * 1.2);
+            this.activeTp = c - (this.atrVal * 2.0);
+        }
+
+        // Dynamic Take Profit Signals (Momentum Fade / 9 EMA Cross)
+        const tpCall = this.inCall && !callSignal && ((c < this.ema9Val && this.prevClose >= this.ema9Val) || (macdHist < 0 && this.prevHist >= 0));
+        const tpPut = this.inPut && !putSignal && ((c > this.ema9Val && this.prevClose <= this.ema9Val) || (macdHist > 0 && this.prevHist <= 0));
+
+        if (tpCall || tpPut) {
+            this.inCall = false;
+            this.inPut = false;
+        }
+
+        // 1. Plot Trend Ribbon
+        this.ema9Plot(this.ema9Val);
+        this.ema21Plot(this.ema21Val);
+        this.ema50Plot(this.ema50Val);
+        this.ema200Plot(this.ema200Val);
+
+        // 2. Plot Dynamic Stop Loss & Target lines during active trade
+        this.stopLossPlot((this.inCall || this.inPut) ? this.activeSl : NaN);
+        this.takeProfitPlot((this.inCall || this.inPut) ? this.activeTp : NaN);
+
+        // 3. Plot Signal Dots (Clearly spaced from candle wicks)
+        this.callPlot(callSignal ? l * 0.995 : NaN);
+        this.putPlot(putSignal ? h * 1.005 : NaN);
+        this.tpCallPlot(tpCall ? h * 1.006 : NaN);
+        this.tpPutPlot(tpPut ? l * 0.994 : NaN);
+
+        this.prevClose = c;
+        this.prevRsi = rsi;
+        this.prevHist = macdHist;
+    }
+}
+
+export default AlphaWaveOptions;

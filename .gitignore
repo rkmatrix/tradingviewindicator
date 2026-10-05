@@ -1,0 +1,17 @@
+# Secrets (Telegram token, chat id) - copy .env.example to .env locally
+.env
+
+# Runtime state written by app.py (signal history, logs)
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

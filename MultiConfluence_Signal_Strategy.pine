@@ -1,0 +1,382 @@
+//@version=5
+strategy("AlphaWave Options Strategy Tester [CALL / PUT / TP]",
+      shorttitle="AlphaWave Options Strategy",
+      overlay=true,
+      initial_capital=10000,
+      default_qty_type=strategy.percent_of_equity,
+      default_qty_value=100,
+      commission_type=strategy.commission.percent,
+      commission_value=0.03,
+      slippage=1,
+      pyramiding=0,
+      calc_on_every_tick=false,
+      process_orders_on_close=true)
+
+// =============================================================================
+// ALPHAWAVE OPTIONS STRATEGY TESTER (PINE SCRIPT v5)
+// Mirrors the AlphaWave indicator's signal engine 1:1 so the Strategy Tester
+// reports exactly what the indicator would have signalled.
+//
+// Execution model: process_orders_on_close=true -> entries fill at the close
+// of the signal bar (the same price the indicator / webhook reports). Stops and
+// limits are armed on the entry bar itself, so no bar is ever unprotected.
+// =============================================================================
+
+// --- 1. USER INPUT CONTROLS -------------------------------------------------
+grp_strat    = "Signal Engine"
+tradeDir     = input.string("Both CALL & PUT", "Allowed Contracts", options=["Both CALL & PUT", "CALL Only", "PUT Only"], group=grp_strat)
+signalMode   = input.string("All Confluence (Pullback + Volume Reversal)", "Signal Mode",
+      options=["All Confluence (Pullback + Volume Reversal)", "Value Zone Pullback Only", "Volume Breakout Reversal Only"], group=grp_strat)
+cooldownBars = input.int(0, "Cooldown Bars After An Exit (0 = Off)", minval=0, group=grp_strat,
+      tooltip="Minimum bars after an exit before a new CALL / PUT entry is allowed.")
+
+grp_exit     = "Trade Lifecycle & Exits"
+useDynTp     = input.bool(true, "Momentum-Fade Exit (9 EMA Break / MACD Roll)", group=grp_exit)
+tp1Pct       = input.int(50, "TP1 Trim Size (% of Position, 0 = No Trim)", minval=0, maxval=90, step=5, group=grp_exit)
+beAfterTp1   = input.bool(true, "Move Stop To Entry After TP1 Fills", group=grp_exit)
+maxHoldBars  = input.int(0, "Max Holding Bars - Theta Protection (0 = Off)", minval=0, group=grp_exit,
+      tooltip="Force an exit after this many bars in a trade. 0 disables the time exit.")
+exitOnOpp    = input.bool(true, "Exit On Opposite Signal", group=grp_exit,
+      tooltip="When an opposite raw signal appears, close the open trade. If that direction is also allowed, the strategy reverses into it.")
+
+grp_size     = "Position Sizing"
+useRiskSize  = input.bool(false, "Size By Risk % Of Equity (ATR Stop Distance)", group=grp_size,
+      tooltip="Quantity = (Equity x Risk %) / (ATR x SL multiplier). When off, the strategy's default order size (Properties tab) is used.")
+riskPct      = input.float(1.0, "Risk Per Trade (% of Equity)", minval=0.1, maxval=10, step=0.1, group=grp_size)
+
+grp_trend    = "1. Trend & Baseline Settings"
+emaFastLen   = input.int(9,   "Fast EMA Length", minval=1, group=grp_trend)
+emaMedLen    = input.int(21,  "Medium EMA (Value Zone) Length", minval=1, group=grp_trend)
+emaSlowLen   = input.int(50,  "Slow EMA Length", minval=1, group=grp_trend)
+emaBaseLen   = input.int(200, "Macro Baseline EMA (200) Length", minval=1, group=grp_trend)
+filter200    = input.string("Flexible (Allow Volume Reversals)", "200 EMA Filter Mode",
+      options=["Flexible (Allow Volume Reversals)", "Strict (Above/Below 200 Only)", "Disabled"], group=grp_trend)
+
+grp_htf      = "1b. Higher-Timeframe Bias Filter (Optional)"
+useHtf       = input.bool(false, "Require Higher-Timeframe EMA Alignment", group=grp_htf)
+htfTf        = input.timeframe("60", "Higher Timeframe", group=grp_htf, tooltip="Must be higher than the chart timeframe.")
+htfEmaLen    = input.int(50, "HTF EMA Length", minval=1, group=grp_htf)
+
+grp_mom      = "2. Momentum Confirmation (RSI & MACD)"
+useRsi       = input.bool(true, "Use RSI Momentum Filter", group=grp_mom)
+rsiLen       = input.int(14, "RSI Length", minval=1, group=grp_mom)
+rsiBullBuy   = input.int(45, "RSI Bullish Threshold (CALL Pullback)", minval=20, maxval=60, group=grp_mom)
+rsiBearSell  = input.int(55, "RSI Bearish Threshold (PUT Pullback)", minval=40, maxval=80, group=grp_mom)
+boRsiCall    = input.int(46, "RSI Minimum For Breakout CALL", minval=30, maxval=70, group=grp_mom)
+boRsiPut     = input.int(54, "RSI Maximum For Breakout PUT", minval=30, maxval=70, group=grp_mom)
+useMacd      = input.bool(true, "Use MACD Momentum Filter", group=grp_mom)
+macdFast     = input.int(12, "MACD Fast Length", minval=1, group=grp_mom)
+macdSlow     = input.int(26, "MACD Slow Length", minval=1, group=grp_mom)
+macdSignal   = input.int(9,  "MACD Signal Length", minval=1, group=grp_mom)
+
+grp_regime   = "2b. Trend-Strength Regime Filter (Optional)"
+useAdx       = input.bool(false, "Require ADX Above Threshold (Skip Chop)", group=grp_regime)
+adxLen       = input.int(14, "DI Length", minval=1, group=grp_regime)
+adxSmooth    = input.int(14, "ADX Smoothing", minval=1, group=grp_regime)
+adxMin       = input.float(20, "Minimum ADX", minval=5, maxval=60, step=1, group=grp_regime)
+
+grp_vol      = "3. Volatility, Value Zone & Targets (ATR)"
+atrLen       = input.int(14, "ATR Length", minval=1, group=grp_vol)
+slAtrMult    = input.float(1.2, "Stop Loss ATR Multiplier", minval=0.3, step=0.1, group=grp_vol)
+tp1AtrMult   = input.float(1.5, "Take Profit 1 ATR (Trim)", minval=0.3, step=0.1, group=grp_vol)
+tp2AtrMult   = input.float(2.5, "Take Profit 2 ATR (Close Runner)", minval=0.5, step=0.1, group=grp_vol)
+zoneMode     = input.string("Percent", "Value Zone Tolerance Mode", options=["Percent", "ATR"], group=grp_vol)
+zoneTolPct   = input.float(1.2, "Zone Reach Above/Below 21 EMA (%)", minval=0, step=0.1, group=grp_vol)
+zoneDepthPct = input.float(2.5, "Max Close Beyond 50 EMA (%)", minval=0, step=0.1, group=grp_vol)
+zoneTolAtr   = input.float(0.5, "Zone Reach Above/Below 21 EMA (ATR x)", minval=0, step=0.1, group=grp_vol)
+zoneDepthAtr = input.float(1.0, "Max Close Beyond 50 EMA (ATR x)", minval=0, step=0.1, group=grp_vol)
+
+grp_volm     = "4. Institutional Volume Confirmation"
+useVolFilter = input.bool(true, "Require Volume Confirmation", group=grp_volm)
+volMaLen     = input.int(20, "Volume MA Length", minval=1, group=grp_volm)
+volMult      = input.float(0.80, "Pullback Volume Factor", minval=0.1, step=0.05, group=grp_volm)
+volBreakMult = input.float(1.10, "Breakout Volume Surge Factor", minval=0.5, step=0.05, group=grp_volm)
+
+grp_sess     = "4b. Session Filter (Intraday Only)"
+useSession   = input.bool(false, "Only Trade Inside Session", group=grp_sess)
+sessionStr   = input.session("0930-1600", "Session (Exchange Time)", group=grp_sess)
+
+grp_dates    = "5. Date Range Filter"
+useDateFilter = input.bool(false, "Enable Custom Date Filter", group=grp_dates)
+startDate     = input.time(timestamp("2021-01-01 00:00:00"), "Start Date", group=grp_dates)
+endDate       = input.time(timestamp("2030-01-01 00:00:00"), "End Date", group=grp_dates)
+
+grp_vis      = "6. Visuals"
+showSignals  = input.bool(true, "Show CALL / PUT Entry Labels", group=grp_vis)
+showLevels   = input.bool(true, "Show Active Entry / SL / TP Lines", group=grp_vis)
+showStats    = input.bool(true, "Show Performance Table", group=grp_vis)
+statsPos     = input.string("Top Right", "Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grp_vis)
+
+inDateRange = not useDateFilter or (time >= startDate and time <= endDate)
+
+// --- 2. CORE CALCULATIONS (identical to the indicator) ---------------------
+emaFast = ta.ema(close, emaFastLen)
+emaMed  = ta.ema(close, emaMedLen)
+emaSlow = ta.ema(close, emaSlowLen)
+emaBase = ta.ema(close, emaBaseLen)
+
+rsiVal  = ta.rsi(close, rsiLen)
+[macdLine, signalLine, histLine] = ta.macd(close, macdFast, macdSlow, macdSignal)
+atrVal  = ta.atr(atrLen)
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxSmooth)
+
+volMa      = ta.sma(volume, volMaLen)
+hasVolume  = not na(volume) and not na(volMa) and volMa > 0
+volOkPull  = not useVolFilter or not hasVolume or volume >= volMa * volMult
+volOkBreak = not useVolFilter or not hasVolume or volume >= volMa * volBreakMult
+
+htfEma    = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen)[1], lookahead=barmerge.lookahead_on)
+htfClose  = request.security(syminfo.tickerid, htfTf, close[1], lookahead=barmerge.lookahead_on)
+htfOkCall = not useHtf or htfClose > htfEma
+htfOkPut  = not useHtf or htfClose < htfEma
+
+inSession = not useSession or not timeframe.isintraday or not na(time(timeframe.period, sessionStr, syminfo.timezone))
+adxOk     = not useAdx or adxVal >= adxMin
+gateOk    = inSession and adxOk
+
+rsiBullTurn    = ta.crossover(rsiVal, rsiBullBuy)
+rsiBearTurn    = ta.crossunder(rsiVal, rsiBearSell)
+macdBullTurn   = ta.crossover(histLine, 0)
+macdBearTurn   = ta.crossunder(histLine, 0)
+closeOverFast  = ta.crossover(close, emaFast)
+closeUnderFast = ta.crossunder(close, emaFast)
+
+// --- 3. DUAL-ENGINE CONFLUENCE EVALUATION ---------------------------------
+strict200   = filter200 == "Strict (Above/Below 200 Only)"
+pass200Call = not strict200 or close > emaBase
+pass200Put  = not strict200 or close < emaBase
+
+bullTrend = (strict200 ? close > emaBase : close > emaSlow) and emaMed > emaSlow
+bearTrend = (strict200 ? close < emaBase : close < emaSlow) and emaMed < emaSlow
+
+zoneReach = zoneMode == "ATR" ? atrVal * zoneTolAtr   : emaMed  * zoneTolPct   / 100
+zoneDepth = zoneMode == "ATR" ? atrVal * zoneDepthAtr : emaSlow * zoneDepthPct / 100
+bullDip   = low  <= emaMed + zoneReach and close >= emaSlow - zoneDepth
+bearRally = high >= emaMed - zoneReach and close <= emaSlow + zoneDepth
+
+noMomFilter = not useRsi and not useMacd
+bullTrigger = noMomFilter or (useRsi and rsiBullTurn) or (useMacd and macdBullTurn)
+bearTrigger = noMomFilter or (useRsi and rsiBearTurn) or (useMacd and macdBearTurn)
+
+pullbackCall = bullTrend and bullDip   and bullTrigger and volOkPull and pass200Call
+pullbackPut  = bearTrend and bearRally and bearTrigger and volOkPull and pass200Put
+
+wasBelowCall = close[1] <= emaFast[1] or close[1] <= emaMed[1] or open <= emaFast or open <= emaMed
+wasAbovePut  = close[1] >= emaFast[1] or close[1] >= emaMed[1] or open >= emaFast or open >= emaMed
+boMacdCall   = not useMacd or (histLine > 0 and histLine > histLine[1])
+boMacdPut    = not useMacd or (histLine < 0 and histLine < histLine[1])
+boRsiOkCall  = not useRsi or rsiVal >= boRsiCall
+boRsiOkPut   = not useRsi or rsiVal <= boRsiPut
+
+breakoutCall = wasBelowCall and close > emaFast and close > emaMed and close > open and volOkBreak and boMacdCall and boRsiOkCall and pass200Call
+breakoutPut  = wasAbovePut  and close < emaFast and close < emaMed and close < open and volOkBreak and boMacdPut  and boRsiOkPut  and pass200Put
+
+modeCall = signalMode == "Value Zone Pullback Only" ? pullbackCall : signalMode == "Volume Breakout Reversal Only" ? breakoutCall : (pullbackCall or breakoutCall)
+modePut  = signalMode == "Value Zone Pullback Only" ? pullbackPut  : signalMode == "Volume Breakout Reversal Only" ? breakoutPut  : (pullbackPut  or breakoutPut)
+
+rawCallPre = gateOk and htfOkCall and modeCall
+rawPutPre  = gateOk and htfOkPut  and modePut
+conflict   = rawCallPre and rawPutPre
+rawCall    = rawCallPre and not conflict
+rawPut     = rawPutPre  and not conflict
+
+allowCall = tradeDir != "PUT Only"
+allowPut  = tradeDir != "CALL Only"
+
+// --- 4. EXECUTION & TRADE MANAGEMENT --------------------------------------
+var float entryPx     = na
+var float slLevel     = na
+var float tp1Level    = na
+var float tp2Level    = na
+var int   entryBar    = na
+var bool  tp1Done     = false
+var int   lastExitBar = na
+var string engineUsed = ""
+
+float posSize = strategy.position_size
+bool  inLong  = posSize > 0
+bool  inShort = posSize < 0
+bool  isFlat  = posSize == 0
+
+// Track the bar on which we became flat (for cooldown)
+if isFlat and nz(posSize[1]) != 0
+    lastExitBar := bar_index
+
+bool afterEntry = not na(entryBar) and bar_index > entryBar
+bool cooldownOk = cooldownBars == 0 or na(lastExitBar) or bar_index - lastExitBar >= cooldownBars
+
+bool callSignal = inDateRange and allowCall and rawCall and not inLong  and cooldownOk
+bool putSignal  = inDateRange and allowPut  and rawPut  and not inShort and cooldownOk
+
+// Shared JSON builder for order-fill alerts ("Order fills and alert() function calls")
+f_num(float v) =>
+    na(v) ? "null" : str.tostring(v, format.mintick)
+
+f_json(string action, string engine, string reason, float px, float sl, float tp1, float tp2) =>
+    '{"action": "' + action + '", "ticker": "' + syminfo.ticker + '", "tf": "' + timeframe.period + '", "engine": "' + engine +
+      '", "reason": "' + reason + '", "price": ' + f_num(px) + ', "sl": ' + f_num(sl) + ', "tp1": ' + f_num(tp1) + ', "tp2": ' + f_num(tp2) + '}'
+
+// 4a. TP1 partial fill detected -> move stop to breakeven on the runner
+if inLong and not tp1Done and posSize < nz(posSize[1]) and nz(posSize[1]) > 0
+    tp1Done := true
+    if beAfterTp1
+        slLevel := strategy.position_avg_price
+        strategy.exit("CALL TP2", from_entry="CALL", limit=tp2Level, stop=slLevel, comment_profit="TP2 CALL", comment_loss="BE CALL",
+          alert_profit=f_json("TP_CALL", engineUsed, "TP2_TARGET", tp2Level, slLevel, tp1Level, tp2Level),
+          alert_loss=f_json("TP_CALL", engineUsed, "BREAKEVEN_STOP", slLevel, slLevel, tp1Level, tp2Level))
+
+if inShort and not tp1Done and posSize > nz(posSize[1]) and nz(posSize[1]) < 0
+    tp1Done := true
+    if beAfterTp1
+        slLevel := strategy.position_avg_price
+        strategy.exit("PUT TP2", from_entry="PUT", limit=tp2Level, stop=slLevel, comment_profit="TP2 PUT", comment_loss="BE PUT",
+          alert_profit=f_json("TP_PUT", engineUsed, "TP2_TARGET", tp2Level, slLevel, tp1Level, tp2Level),
+          alert_loss=f_json("TP_PUT", engineUsed, "BREAKEVEN_STOP", slLevel, slLevel, tp1Level, tp2Level))
+
+// 4b. Discretionary exits for open positions (skipped when a reversal entry fires this bar)
+bool longDyn  = inLong  and afterEntry and useDynTp and (closeUnderFast or macdBearTurn)
+bool longTime = inLong  and afterEntry and maxHoldBars > 0 and bar_index - entryBar >= maxHoldBars
+bool longOpp  = inLong  and exitOnOpp and rawPut
+bool shortDyn = inShort and afterEntry and useDynTp and (closeOverFast or macdBullTurn)
+bool shortTime = inShort and afterEntry and maxHoldBars > 0 and bar_index - entryBar >= maxHoldBars
+bool shortOpp = inShort and exitOnOpp and rawCall
+
+if inLong and not putSignal
+    if longDyn
+        strategy.close("CALL", comment="TP CALL (Momentum)", alert_message=f_json("TP_CALL", engineUsed, "MOMENTUM_FADE", close, slLevel, tp1Level, tp2Level))
+    else if longTime
+        strategy.close("CALL", comment="Time Exit CALL", alert_message=f_json("TP_CALL", engineUsed, "TIME_EXIT", close, slLevel, tp1Level, tp2Level))
+    else if longOpp
+        strategy.close("CALL", comment="Opposite Signal", alert_message=f_json("TP_CALL", engineUsed, "OPPOSITE_SIGNAL", close, slLevel, tp1Level, tp2Level))
+
+if inShort and not callSignal
+    if shortDyn
+        strategy.close("PUT", comment="TP PUT (Momentum)", alert_message=f_json("TP_PUT", engineUsed, "MOMENTUM_FADE", close, slLevel, tp1Level, tp2Level))
+    else if shortTime
+        strategy.close("PUT", comment="Time Exit PUT", alert_message=f_json("TP_PUT", engineUsed, "TIME_EXIT", close, slLevel, tp1Level, tp2Level))
+    else if shortOpp
+        strategy.close("PUT", comment="Opposite Signal", alert_message=f_json("TP_PUT", engineUsed, "OPPOSITE_SIGNAL", close, slLevel, tp1Level, tp2Level))
+
+// 4c. Entries (and reversals). Stops / targets are armed on the SAME bar as the entry.
+float riskQty = math.max(1, math.floor(strategy.equity * riskPct / 100 / math.max(atrVal * slAtrMult, syminfo.mintick)))
+
+if callSignal
+    if inShort
+        strategy.cancel("PUT TP1")
+        strategy.cancel("PUT TP2")
+        strategy.close("PUT", comment="Reversal -> CALL", alert_message=f_json("TP_PUT", engineUsed, "REVERSAL", close, slLevel, tp1Level, tp2Level))
+    entryPx    := close
+    entryBar   := bar_index
+    tp1Done    := false
+    engineUsed := pullbackCall ? "PULLBACK" : "BREAKOUT"
+    slLevel    := close - atrVal * slAtrMult
+    tp1Level   := close + atrVal * tp1AtrMult
+    tp2Level   := close + atrVal * tp2AtrMult
+    string callMsg = f_json("BUY_CALL", engineUsed, "ENTRY", close, slLevel, tp1Level, tp2Level)
+    if useRiskSize
+        strategy.entry("CALL", strategy.long, qty=riskQty, comment="CALL " + engineUsed, alert_message=callMsg)
+    else
+        strategy.entry("CALL", strategy.long, comment="CALL " + engineUsed, alert_message=callMsg)
+    if tp1Pct > 0
+        strategy.exit("CALL TP1", from_entry="CALL", qty_percent=tp1Pct, limit=tp1Level, stop=slLevel, comment_profit="TP1 CALL", comment_loss="SL CALL",
+          alert_profit='{"action": "TP1_TRIM_CALL", "ticker": "' + syminfo.ticker + '", "price": ' + f_num(tp1Level) + '}',
+          alert_loss=f_json("TP_CALL", engineUsed, "STOP_LOSS", slLevel, slLevel, tp1Level, tp2Level))
+    strategy.exit("CALL TP2", from_entry="CALL", limit=tp2Level, stop=slLevel, comment_profit="TP2 CALL", comment_loss="SL CALL",
+      alert_profit=f_json("TP_CALL", engineUsed, "TP2_TARGET", tp2Level, slLevel, tp1Level, tp2Level),
+      alert_loss=f_json("TP_CALL", engineUsed, "STOP_LOSS", slLevel, slLevel, tp1Level, tp2Level))
+
+if putSignal
+    if inLong
+        strategy.cancel("CALL TP1")
+        strategy.cancel("CALL TP2")
+        strategy.close("CALL", comment="Reversal -> PUT", alert_message=f_json("TP_CALL", engineUsed, "REVERSAL", close, slLevel, tp1Level, tp2Level))
+    entryPx    := close
+    entryBar   := bar_index
+    tp1Done    := false
+    engineUsed := pullbackPut ? "PULLBACK" : "BREAKOUT"
+    slLevel    := close + atrVal * slAtrMult
+    tp1Level   := close - atrVal * tp1AtrMult
+    tp2Level   := close - atrVal * tp2AtrMult
+    string putMsg = f_json("BUY_PUT", engineUsed, "ENTRY", close, slLevel, tp1Level, tp2Level)
+    if useRiskSize
+        strategy.entry("PUT", strategy.short, qty=riskQty, comment="PUT " + engineUsed, alert_message=putMsg)
+    else
+        strategy.entry("PUT", strategy.short, comment="PUT " + engineUsed, alert_message=putMsg)
+    if tp1Pct > 0
+        strategy.exit("PUT TP1", from_entry="PUT", qty_percent=tp1Pct, limit=tp1Level, stop=slLevel, comment_profit="TP1 PUT", comment_loss="SL PUT",
+          alert_profit='{"action": "TP1_TRIM_PUT", "ticker": "' + syminfo.ticker + '", "price": ' + f_num(tp1Level) + '}',
+          alert_loss=f_json("TP_PUT", engineUsed, "STOP_LOSS", slLevel, slLevel, tp1Level, tp2Level))
+    strategy.exit("PUT TP2", from_entry="PUT", limit=tp2Level, stop=slLevel, comment_profit="TP2 PUT", comment_loss="SL PUT",
+      alert_profit=f_json("TP_PUT", engineUsed, "TP2_TARGET", tp2Level, slLevel, tp1Level, tp2Level),
+      alert_loss=f_json("TP_PUT", engineUsed, "STOP_LOSS", slLevel, slLevel, tp1Level, tp2Level))
+
+// 4d. Flatten when the backtest window closes
+if useDateFilter and not inDateRange and not isFlat
+    strategy.close_all(comment="Date Range End")
+
+// --- 5. VISUAL PLOTS -------------------------------------------------------
+plot(emaFast, title="Fast EMA (9)",   color=color.new(#00E676, 20), linewidth=1)
+plot(emaMed,  title="Med EMA (21)",   color=color.new(#FFD600, 20), linewidth=2)
+plot(emaSlow, title="Slow EMA (50)",  color=color.new(#FF9100, 30), linewidth=2)
+plot(emaBase, title="200 EMA",        color=color.new(#2979FF, 0),  linewidth=3)
+plot(htfEma,  title="HTF EMA Bias",   color=color.new(#B388FF, 30), linewidth=1, style=plot.style_circles, display=useHtf ? display.all : display.none)
+
+plotshape(showSignals and callSignal, title="CALL Entry", style=shape.labelup,   location=location.belowbar, color=color.new(#00C853, 0), text="CALL", textcolor=color.white, size=size.small)
+plotshape(showSignals and putSignal,  title="PUT Entry",  style=shape.labeldown, location=location.abovebar, color=color.new(#D50000, 0), text="PUT",  textcolor=color.white, size=size.small)
+
+bool showLn = showLevels and not isFlat
+plot(showLn ? slLevel  : na, title="Active Stop Loss", color=color.new(#FF1744, 20), style=plot.style_linebr, linewidth=2)
+plot(showLn ? tp1Level : na, title="Active TP1",       color=color.new(#00E676, 40), style=plot.style_linebr, linewidth=1)
+plot(showLn ? tp2Level : na, title="Active TP2",       color=color.new(#00C853, 20), style=plot.style_linebr, linewidth=2)
+plot(showLn ? strategy.position_avg_price : na, title="Avg Entry", color=color.new(#FFFFFF, 60), style=plot.style_linebr, linewidth=1)
+
+bgcolor(inLong ? color.new(#00E676, 94) : inShort ? color.new(#FF1744, 94) : color(na))
+
+// --- 6. PERFORMANCE TABLE --------------------------------------------------
+var table stats = table.new(statsPos == "Top Right" ? position.top_right : statsPos == "Top Left" ? position.top_left : statsPos == "Bottom Right" ? position.bottom_right : position.bottom_left,
+      2, 11, bgcolor=color.new(#0D1117, 15), border_width=1, border_color=color.new(#FFFFFF, 85))
+
+f_cell(int col, int row, string txt, color txtCol) =>
+    table.cell(stats, col, row, txt, text_color=txtCol, bgcolor=color.new(#0D1117, 15), text_size=size.small, text_halign=text.align_left)
+
+if showStats and barstate.islast
+    color cHead = color.new(#FFFFFF, 0)
+    color cBull = color.new(#00C853, 0)
+    color cBear = color.new(#D50000, 0)
+    color cGold = color.new(#FFD600, 0)
+
+    int   nTrades  = strategy.closedtrades
+    int   nWins    = strategy.wintrades
+    int   nLoss    = strategy.losstrades
+    float netP     = strategy.netprofit
+    float netPct   = netP / strategy.initial_capital * 100
+    float winRate  = nTrades > 0 ? nWins / nTrades * 100 : 0
+    float pf       = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    float avgWin   = nWins > 0 ? strategy.grossprofit / nWins : 0
+    float avgLoss  = nLoss > 0 ? strategy.grossloss / nLoss : 0
+    float expect   = nTrades > 0 ? netP / nTrades : 0
+    float ddPct    = strategy.max_drawdown / strategy.initial_capital * 100
+    string posTxt  = inLong ? "CALL" : inShort ? "PUT" : "FLAT"
+
+    f_cell(0, 0,  "AlphaWave Backtest", cGold)
+    f_cell(1, 0,  syminfo.ticker + "  " + timeframe.period, cGold)
+    f_cell(0, 1,  "Net Profit", cHead)
+    f_cell(1, 1,  str.tostring(netP, "#.##") + "  (" + str.tostring(netPct, "#.##") + "%)", netP >= 0 ? cBull : cBear)
+    f_cell(0, 2,  "Closed Trades", cHead)
+    f_cell(1, 2,  str.tostring(nTrades) + "  (W " + str.tostring(nWins) + " / L " + str.tostring(nLoss) + ")", cHead)
+    f_cell(0, 3,  "Win Rate", cHead)
+    f_cell(1, 3,  str.tostring(winRate, "#.#") + "%", winRate >= 50 ? cBull : cBear)
+    f_cell(0, 4,  "Profit Factor", cHead)
+    f_cell(1, 4,  na(pf) ? "n/a" : str.tostring(pf, "#.##"), na(pf) ? cHead : pf >= 1.5 ? cBull : pf >= 1 ? cGold : cBear)
+    f_cell(0, 5,  "Avg Win / Avg Loss", cHead)
+    f_cell(1, 5,  str.tostring(avgWin, "#.##") + " / " + str.tostring(avgLoss, "#.##"), cHead)
+    f_cell(0, 6,  "Expectancy / Trade", cHead)
+    f_cell(1, 6,  str.tostring(expect, "#.##"), expect >= 0 ? cBull : cBear)
+    f_cell(0, 7,  "Max Drawdown", cHead)
+    f_cell(1, 7,  str.tostring(strategy.max_drawdown, "#.##") + "  (" + str.tostring(ddPct, "#.##") + "%)", ddPct <= 10 ? cBull : ddPct <= 20 ? cGold : cBear)
+    f_cell(0, 8,  "Open P&L", cHead)
+    f_cell(1, 8,  str.tostring(strategy.openprofit, "#.##"), strategy.openprofit >= 0 ? cBull : cBear)
+    f_cell(0, 9,  "Position", cHead)
+    f_cell(1, 9,  posTxt + (isFlat ? "" : "  (" + str.tostring(bar_index - entryBar) + " bars)"), inLong ? cBull : inShort ? cBear : cHead)
+    f_cell(0, 10, "Mode", cHead)
+    f_cell(1, 10, (signalMode == "Value Zone Pullback Only" ? "Pullback" : signalMode == "Volume Breakout Reversal Only" ? "Breakout" : "All") + " | " + tradeDir, cHead)
