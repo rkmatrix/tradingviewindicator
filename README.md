@@ -22,12 +22,14 @@ A single indicator produces whipsaws in ranging markets. The **AlphaWave Conflue
 
 **Engine A - Value Zone Pullback ("Buy the Dip / Sell the Rally")**
 1. **Trend Regime**: Price > 50 EMA and 21 EMA > 50 EMA for CALLs (mirror for PUTs). Optional *Strict* mode also requires the 200 EMA side.
-2. **Value Zone Touch**: The bar's low reaches the 21 EMA band while the close holds the 50 EMA. Band width is `%`-based (legacy) or ATR-adaptive.
-3. **Momentum Trigger**: RSI (14) crossing 45 up / 55 down, or the MACD (12, 26, 9) histogram crossing zero.
-4. **Volume**: Bar volume >= 80% of the 20-period volume MA.
+2. **Value Zone Touch**: The bar's low reaches the 21 EMA band (or, in strong trends, touches the 9 EMA) while the close holds the 50 EMA. Band width is ATR-adaptive by default (`%`-based legacy mode available).
+3. **Momentum Trigger** (any one):
+   - RSI (14) crossing 45 up / 55 down, or the MACD (12, 26, 9) histogram crossing zero (momentum reset), **or**
+   - *Pullback-Resume*: price touched the value zone within the last 3 bars and now closes back above the 9 EMA on a bullish bar with RSI > 50 and MACD histogram > 0 (trend continuation; mirror for PUTs).
+4. **Volume**: Bar volume >= 80% of the 20-period volume **median** (robust to the opening-bar spike; SMA legacy mode available).
 
 **Engine B - Volume Breakout / V-Reversal**
-- Price emerges from below (above) the 9 and 21 EMA on a bullish (bearish) candle with volume >= 110% of the volume MA, MACD histogram positive and rising (negative and falling), RSI >= 46 (<= 54).
+- Price emerges from below (above) the 9 and 21 EMA on a bullish (bearish) candle with volume >= 110% of the volume median, MACD histogram positive and rising (negative and falling), RSI >= 46 (<= 54).
 
 **Trade Lifecycle (identical in indicator and strategy)**
 - Entry at the signal bar close; SL = 1.2x ATR, TP1 = 1.5x ATR (trim), TP2 = 2.5x ATR (runner).

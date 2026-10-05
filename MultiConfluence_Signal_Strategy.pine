@@ -68,6 +68,9 @@ useMacd      = input.bool(true, "Use MACD Momentum Filter", group=grp_mom)
 macdFast     = input.int(12, "MACD Fast Length", minval=1, group=grp_mom)
 macdSlow     = input.int(26, "MACD Slow Length", minval=1, group=grp_mom)
 macdSignal   = input.int(9,  "MACD Signal Length", minval=1, group=grp_mom)
+useResume    = input.bool(true, "Use EMA Pullback-Resume Trigger (Trend Continuation)", group=grp_mom,
+      tooltip="Fires when price has touched the 9 / 21 EMA zone within the last N bars and closes back above the 9 EMA on a bullish bar while RSI > 50 and MACD histogram > 0 (mirror for PUTs).")
+resumeBars   = input.int(3, "Resume: Max Bars Since EMA Touch", minval=1, maxval=10, group=grp_mom)
 
 grp_regime   = "2b. Trend-Strength Regime Filter (Optional)"
 useAdx       = input.bool(false, "Require ADX Above Threshold (Skip Chop)", group=grp_regime)
@@ -80,15 +83,19 @@ atrLen       = input.int(14, "ATR Length", minval=1, group=grp_vol)
 slAtrMult    = input.float(1.2, "Stop Loss ATR Multiplier", minval=0.3, step=0.1, group=grp_vol)
 tp1AtrMult   = input.float(1.5, "Take Profit 1 ATR (Trim)", minval=0.3, step=0.1, group=grp_vol)
 tp2AtrMult   = input.float(2.5, "Take Profit 2 ATR (Close Runner)", minval=0.5, step=0.1, group=grp_vol)
-zoneMode     = input.string("Percent", "Value Zone Tolerance Mode", options=["Percent", "ATR"], group=grp_vol)
+zoneMode     = input.string("ATR", "Value Zone Tolerance Mode", options=["ATR", "Percent"], group=grp_vol)
 zoneTolPct   = input.float(1.2, "Zone Reach Above/Below 21 EMA (%)", minval=0, step=0.1, group=grp_vol)
 zoneDepthPct = input.float(2.5, "Max Close Beyond 50 EMA (%)", minval=0, step=0.1, group=grp_vol)
 zoneTolAtr   = input.float(0.5, "Zone Reach Above/Below 21 EMA (ATR x)", minval=0, step=0.1, group=grp_vol)
 zoneDepthAtr = input.float(1.0, "Max Close Beyond 50 EMA (ATR x)", minval=0, step=0.1, group=grp_vol)
+fastZone     = input.bool(true, "Count 9 EMA Touch As Value Zone (Strong Trends)", group=grp_vol)
+fastTouchAtr = input.float(0.15, "9 EMA Touch Tolerance (ATR x)", minval=0, step=0.05, group=grp_vol)
 
 grp_volm     = "4. Institutional Volume Confirmation"
 useVolFilter = input.bool(true, "Require Volume Confirmation", group=grp_volm)
-volMaLen     = input.int(20, "Volume MA Length", minval=1, group=grp_volm)
+volBaseline  = input.string("Median (Robust To Open Spikes)", "Volume Baseline", options=["Median (Robust To Open Spikes)", "SMA (Legacy)"], group=grp_volm,
+      tooltip="A simple average is dominated by the huge opening bars on intraday charts, which blocks every signal for the next 1-2 hours. The median ignores those spikes.")
+volMaLen     = input.int(20, "Volume Baseline Length", minval=1, group=grp_volm)
 volMult      = input.float(0.80, "Pullback Volume Factor", minval=0.1, step=0.05, group=grp_volm)
 volBreakMult = input.float(1.10, "Breakout Volume Surge Factor", minval=0.5, step=0.05, group=grp_volm)
 
@@ -120,7 +127,9 @@ rsiVal  = ta.rsi(close, rsiLen)
 atrVal  = ta.atr(atrLen)
 [diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxSmooth)
 
-volMa      = ta.sma(volume, volMaLen)
+volSma     = ta.sma(volume, volMaLen)
+volMed     = ta.median(volume, volMaLen)
+volMa      = volBaseline == "SMA (Legacy)" ? volSma : volMed
 hasVolume  = not na(volume) and not na(volMa) and volMa > 0
 volOkPull  = not useVolFilter or not hasVolume or volume >= volMa * volMult
 volOkBreak = not useVolFilter or not hasVolume or volume >= volMa * volBreakMult
@@ -151,15 +160,26 @@ bearTrend = (strict200 ? close < emaBase : close < emaSlow) and emaMed < emaSlow
 
 zoneReach = zoneMode == "ATR" ? atrVal * zoneTolAtr   : emaMed  * zoneTolPct   / 100
 zoneDepth = zoneMode == "ATR" ? atrVal * zoneDepthAtr : emaSlow * zoneDepthPct / 100
-bullDip   = low  <= emaMed + zoneReach and close >= emaSlow - zoneDepth
-bearRally = high >= emaMed - zoneReach and close <= emaSlow + zoneDepth
+fastTouch = atrVal * fastTouchAtr
+
+bullTouch = low  <= emaMed + zoneReach or (fastZone and low  <= emaFast + fastTouch)
+bearTouch = high >= emaMed - zoneReach or (fastZone and high >= emaFast - fastTouch)
+bullDepthOk = close >= emaSlow - zoneDepth
+bearDepthOk = close <= emaSlow + zoneDepth
+bullDip   = bullTouch and bullDepthOk
+bearRally = bearTouch and bearDepthOk
 
 noMomFilter = not useRsi and not useMacd
-bullTrigger = noMomFilter or (useRsi and rsiBullTurn) or (useMacd and macdBullTurn)
-bearTrigger = noMomFilter or (useRsi and rsiBearTurn) or (useMacd and macdBearTurn)
+bullTurn = noMomFilter or (useRsi and rsiBullTurn) or (useMacd and macdBullTurn)
+bearTurn = noMomFilter or (useRsi and rsiBearTurn) or (useMacd and macdBearTurn)
 
-pullbackCall = bullTrend and bullDip   and bullTrigger and volOkPull and pass200Call
-pullbackPut  = bearTrend and bearRally and bearTrigger and volOkPull and pass200Put
+bullTouchedRecently = nz(ta.barssince(bullTouch), 99999) < resumeBars
+bearTouchedRecently = nz(ta.barssince(bearTouch), 99999) < resumeBars
+bullResume = useResume and bullTouchedRecently and bullDepthOk and close > emaFast and close > open and (not useRsi or rsiVal > 50) and (not useMacd or histLine > 0)
+bearResume = useResume and bearTouchedRecently and bearDepthOk and close < emaFast and close < open and (not useRsi or rsiVal < 50) and (not useMacd or histLine < 0)
+
+pullbackCall = bullTrend and pass200Call and volOkPull and ((bullDip and bullTurn) or bullResume)
+pullbackPut  = bearTrend and pass200Put  and volOkPull and ((bearRally and bearTurn) or bearResume)
 
 wasBelowCall = close[1] <= emaFast[1] or close[1] <= emaMed[1] or open <= emaFast or open <= emaMed
 wasAbovePut  = close[1] >= emaFast[1] or close[1] >= emaMed[1] or open >= emaFast or open >= emaMed
