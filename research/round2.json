@@ -1,0 +1,18 @@
+{
+  "baseline": {},
+  "exit AFTER_TP1": {"dyn_tp_mode": "AFTER_TP1"},
+  "exit EMA21": {"dyn_tp_mode": "EMA21"},
+  "exit none (SL/TP only)": {"use_dyn_tp": false},
+  "sess 0945-1500": {"use_session": true, "session": "0945-1500"},
+  "sess 1000-1500": {"use_session": true, "session": "1000-1500"},
+  "EMA21 + sess": {"dyn_tp_mode": "EMA21", "use_session": true, "session": "0945-1500"},
+  "AFTER_TP1 + sess": {"dyn_tp_mode": "AFTER_TP1", "use_session": true, "session": "0945-1500"},
+  "EMA21 + sess + vwap": {"dyn_tp_mode": "EMA21", "use_session": true, "session": "0945-1500", "use_vwap": true},
+  "EMA21 + sess + vwap + adx20": {"dyn_tp_mode": "EMA21", "use_session": true, "session": "0945-1500", "use_vwap": true, "use_adx": true, "adx_min": 20},
+  "EMA21 + sess + vwap + adx20 + loss2": {"dyn_tp_mode": "EMA21", "use_session": true, "session": "0945-1500", "use_vwap": true, "use_adx": true, "adx_min": 20, "max_losses_per_day": 2},
+  "EMA21 + sess + vwap + adx20 + ext0.6": {"dyn_tp_mode": "EMA21", "use_session": true, "session": "0945-1500", "use_vwap": true, "use_adx": true, "adx_min": 20, "max_ext_atr": 0.6},
+  "AFTER_TP1 + sess + vwap + adx20": {"dyn_tp_mode": "AFTER_TP1", "use_session": true, "session": "0945-1500", "use_vwap": true, "use_adx": true, "adx_min": 20},
+  "AFTER_TP1 + sess + vwap + adx20 + loss2": {"dyn_tp_mode": "AFTER_TP1", "use_session": true, "session": "0945-1500", "use_vwap": true, "use_adx": true, "adx_min": 20, "max_losses_per_day": 2},
+  "EMA21 + sess + vwap + adx20 + sl1.5": {"dyn_tp_mode": "EMA21", "use_session": true, "session": "0945-1500", "use_vwap": true, "use_adx": true, "adx_min": 20, "sl_atr": 1.5},
+  "EMA21 + sess + vwap + adx20 + htf": {"dyn_tp_mode": "EMA21", "use_session": true, "session": "0945-1500", "use_vwap": true, "use_adx": true, "adx_min": 20, "use_htf": true}
+}

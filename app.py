@@ -371,7 +371,9 @@ PINE_DEFAULTS: Dict = {
     # Signal Engine
     "cooldown_bars": 0,
     # Trade Lifecycle & Exits
-    "use_dyn_tp": True, "exit_on_sl": True, "exit_on_tp2": True, "be_after_tp1": True, "max_hold_bars": 0,
+    "use_dyn_tp": True,
+    "dyn_tp_mode": "FAST",        # FAST = 9 EMA break / MACD roll | AFTER_TP1 = same, only once TP1 is hit | EMA21 = close through the 21 EMA
+    "exit_on_sl": True, "exit_on_tp2": True, "be_after_tp1": True, "max_hold_bars": 0,
     # 1. Trend & Baseline
     "ema_fast": 9, "ema_med": 21, "ema_slow": 50, "ema_base": 200,
     "filter_200": "FLEXIBLE",          # FLEXIBLE | STRICT | DISABLED
@@ -393,6 +395,14 @@ PINE_DEFAULTS: Dict = {
     "vol_len": 20, "vol_mult": 0.80, "vol_break_mult": 1.10,
     # 4b. Session (exchange time, HHMM-HHMM)
     "use_session": False, "session": "0930-1600",
+    # 4c. Chop & chase guards (0 / False = off)
+    "min_trend_sep_atr": 0.0,     # pullback trend needs |21 EMA - 50 EMA| >= this x ATR
+    "max_ext_atr": 0.0,           # no entry when the close is more than this x ATR beyond the 9 EMA
+    "use_vwap": False,            # CALL only above session VWAP, PUT only below
+    "skip_open_min": 0,           # no new entries in the first N minutes of the session
+    "max_losses_per_day": 0,      # stop taking entries on a symbol after N losing trades that day
+    "loss_cooldown_bars": 0,      # bars to wait after a losing exit
+    "use_orb": False, "orb_min": 30,  # after the opening range: CALL only above OR high, PUT only below OR low
     # Exchange time zone used for the session filter and HTF bar alignment (TradingView uses the symbol's exchange tz)
     "exchange_tz": "America/New_York",
 }
@@ -550,7 +560,21 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
 
     sess_start, sess_end = _parse_session(S["session"])
     idx = df.index
-    tod = (idx.hour * 60 + idx.minute) if S["use_session"] else None
+    tod = idx.hour * 60 + idx.minute
+    day_key = idx.normalize()
+    day_arr = day_key.to_numpy()
+
+    # Session VWAP (ta.vwap(hlc3), anchored to each trading day)
+    hlc3 = (h + l + c) / 3
+    vw_vol = v.fillna(0.0)
+    vwap_num = (hlc3 * vw_vol).groupby(day_key).cumsum()
+    vwap_den = vw_vol.groupby(day_key).cumsum()
+    vwap = (vwap_num / vwap_den.where(vwap_den > 0)).to_numpy()
+    open_min = 9 * 60 + 30
+    in_or = pd.Series((tod >= open_min) & (tod < open_min + S["orb_min"]), index=idx)
+    or_hi = h.where(in_or).groupby(day_key).cummax().groupby(day_key).ffill().to_numpy()
+    or_lo = l.where(in_or).groupby(day_key).cummin().groupby(day_key).ffill().to_numpy()
+    or_done = (tod >= open_min + S["orb_min"])
 
     cn, on, hn, ln = c.to_numpy(), o.to_numpy(), h.to_numpy(), l.to_numpy()
 
@@ -577,6 +601,9 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
     engine_used = ""
     last_bull_touch = None   # for ta.barssince(bullTouch)
     last_bear_touch = None
+    last_loss_bar = None
+    loss_day = None
+    losses_today = 0
 
     all_signals: List[Dict] = []
 
@@ -614,13 +641,16 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
         macd_bear_turn = _crossunder(hl, hl_prev, 0.0, 0.0)
         close_over_fast = _crossover(close, cn[i - 1], ef, ema_fast[i - 1])
         close_under_fast = _crossunder(close, cn[i - 1], ef, ema_fast[i - 1])
+        close_over_med = _crossover(close, cn[i - 1], em, ema_med[i - 1])
+        close_under_med = _crossunder(close, cn[i - 1], em, ema_med[i - 1])
 
         # --- 3. DUAL-ENGINE CONFLUENCE EVALUATION ---
         pass200_call = (not strict200) or close > eb
         pass200_put = (not strict200) or close < eb
 
-        bull_trend = (close > eb if strict200 else close > es) and em > es
-        bear_trend = (close < eb if strict200 else close < es) and em < es
+        min_sep = a * S["min_trend_sep_atr"]
+        bull_trend = (close > eb if strict200 else close > es) and em > es + min_sep
+        bear_trend = (close < eb if strict200 else close < es) and em < es - min_sep
 
         zone_reach = a * S["zone_tol_atr"] if zone_atr else em * S["zone_tol_pct"] / 100
         zone_depth = a * S["zone_depth_atr"] if zone_atr else es * S["zone_depth_pct"] / 100
@@ -666,8 +696,22 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
         else:
             mode_call, mode_put = (pullback_call or breakout_call), (pullback_put or breakout_put)
 
-        raw_call_pre = gate_ok and htf_ok_call and mode_call
-        raw_put_pre = gate_ok and htf_ok_put and mode_put
+        # Chop & chase guards
+        if day_arr[i] != loss_day:
+            loss_day, losses_today = day_arr[i], 0
+        ext_ok = S["max_ext_atr"] <= 0 or abs(close - ef) <= a * S["max_ext_atr"]
+        open_ok = S["skip_open_min"] <= 0 or tod[i] - open_min >= S["skip_open_min"]
+        loss_ok = (S["max_losses_per_day"] <= 0 or losses_today < S["max_losses_per_day"]) and \
+                  (S["loss_cooldown_bars"] <= 0 or last_loss_bar is None or i - last_loss_bar >= S["loss_cooldown_bars"])
+        vw = vwap[i]
+        vwap_call = (not S["use_vwap"]) or np.isnan(vw) or close > vw
+        vwap_put = (not S["use_vwap"]) or np.isnan(vw) or close < vw
+        guard_ok = ext_ok and open_ok and loss_ok
+        orb_call = (not S["use_orb"]) or (or_done[i] and not np.isnan(or_hi[i]) and close > or_hi[i])
+        orb_put = (not S["use_orb"]) or (or_done[i] and not np.isnan(or_lo[i]) and close < or_lo[i])
+
+        raw_call_pre = gate_ok and htf_ok_call and mode_call and guard_ok and vwap_call and orb_call
+        raw_put_pre = gate_ok and htf_ok_put and mode_put and guard_ok and vwap_put and orb_put
         conflict = raw_call_pre and raw_put_pre
         raw_call = raw_call_pre and not conflict
         raw_put = raw_put_pre and not conflict
@@ -680,13 +724,20 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
         call_sl_hit = in_call and after_entry and S["exit_on_sl"] and low <= sl_level
         call_tp1_hit = in_call and after_entry and not tp1_done and high >= tp1_level
         call_tp2_hit = in_call and after_entry and S["exit_on_tp2"] and high >= tp2_level
-        call_dyn_tp = in_call and after_entry and S["use_dyn_tp"] and (close_under_fast or macd_bear_turn)
+        dyn_mode = str(S["dyn_tp_mode"]).upper()
+        if dyn_mode == "EMA21":
+            fade_call, fade_put = close_under_med, close_over_med
+        else:
+            fade_call, fade_put = (close_under_fast or macd_bear_turn), (close_over_fast or macd_bull_turn)
+            if dyn_mode == "AFTER_TP1":
+                fade_call, fade_put = fade_call and tp1_done, fade_put and tp1_done
+        call_dyn_tp = in_call and after_entry and S["use_dyn_tp"] and fade_call
         call_time_up = in_call and after_entry and S["max_hold_bars"] > 0 and i - entry_bar >= S["max_hold_bars"]
 
         put_sl_hit = in_put and after_entry and S["exit_on_sl"] and high >= sl_level
         put_tp1_hit = in_put and after_entry and not tp1_done and low <= tp1_level
         put_tp2_hit = in_put and after_entry and S["exit_on_tp2"] and low <= tp2_level
-        put_dyn_tp = in_put and after_entry and S["use_dyn_tp"] and (close_over_fast or macd_bull_turn)
+        put_dyn_tp = in_put and after_entry and S["use_dyn_tp"] and fade_put
         put_time_up = in_put and after_entry and S["max_hold_bars"] > 0 and i - entry_bar >= S["max_hold_bars"]
 
         call_exit_code = (6 if tp1_done else 3) if call_sl_hit else 2 if call_tp2_hit else 1 if call_dyn_tp else 4 if call_time_up else 0
@@ -728,6 +779,9 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
             pos_dir = 0
             last_exit_bar = i
             entry_bar = None
+            if not np.isnan(exit_pnl) and exit_pnl < 0:
+                last_loss_bar = i
+                losses_today += 1
 
         if call_signal or put_signal:
             pos_dir = 1 if call_signal else -1

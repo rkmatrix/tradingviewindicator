@@ -1,0 +1,16 @@
+{
+  "baseline 5m": {},
+  "orb30 5m": {"use_orb": true},
+  "orb30 + EMA21 + sess 5m": {"use_orb": true, "dyn_tp_mode": "EMA21", "use_session": true, "session": "1000-1500"},
+  "orb30 + AFTER_TP1 + sess 5m": {"use_orb": true, "dyn_tp_mode": "AFTER_TP1", "use_session": true, "session": "1000-1500"},
+  "orb30 + vwap + adx20 5m": {"use_orb": true, "use_vwap": true, "use_adx": true, "adx_min": 20},
+  "orb30 + loss1/day 5m": {"use_orb": true, "max_losses_per_day": 1},
+  "baseline 15m": {"__tf": 15},
+  "EMA21 15m": {"__tf": 15, "dyn_tp_mode": "EMA21"},
+  "AFTER_TP1 15m": {"__tf": 15, "dyn_tp_mode": "AFTER_TP1"},
+  "vwap + adx20 15m": {"__tf": 15, "use_vwap": true, "use_adx": true, "adx_min": 20},
+  "orb30 15m": {"__tf": 15, "use_orb": true},
+  "orb30 + EMA21 15m": {"__tf": 15, "use_orb": true, "dyn_tp_mode": "EMA21"},
+  "sess 1000-1500 15m": {"__tf": 15, "use_session": true, "session": "1000-1500"},
+  "pullbackOnly 15m": {"__tf": 15, "__mode": "PULLBACK"}
+}
