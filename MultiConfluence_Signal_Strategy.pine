@@ -25,8 +25,9 @@ strategy("AlphaWave Options Strategy Tester [CALL / PUT / TP]",
 // --- 1. USER INPUT CONTROLS -------------------------------------------------
 grp_strat    = "Signal Engine"
 tradeDir     = input.string("Both CALL & PUT", "Allowed Contracts", options=["Both CALL & PUT", "CALL Only", "PUT Only"], group=grp_strat)
-signalMode   = input.string("All Confluence (Pullback + Volume Reversal)", "Signal Mode",
-      options=["All Confluence (Pullback + Volume Reversal)", "Value Zone Pullback Only", "Volume Breakout Reversal Only"], group=grp_strat)
+signalMode   = input.string("Value Zone Pullback Only", "Signal Mode",
+      options=["Value Zone Pullback Only", "All Confluence (Pullback + Volume Reversal)", "Volume Breakout Reversal Only"], group=grp_strat,
+      tooltip="Backtested best: 'Value Zone Pullback Only' on a 15-minute chart. The volume-breakout engine and 5-minute charts showed no edge over 60 days across the watchlist.")
 cooldownBars = input.int(0, "Cooldown Bars After An Exit (0 = Off)", minval=0, group=grp_strat,
       tooltip="Minimum bars after an exit before a new CALL / PUT entry is allowed.")
 

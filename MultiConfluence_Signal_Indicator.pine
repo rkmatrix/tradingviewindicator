@@ -14,8 +14,9 @@ indicator("AlphaWave Options Confluence Engine [CALL / PUT / TP]", shorttitle="A
 
 // --- 1. USER INPUT CONTROLS -------------------------------------------------
 grp_strat    = "Signal Engine"
-signalMode   = input.string("All Confluence (Pullback + Volume Reversal)", "Signal Mode",
-      options=["All Confluence (Pullback + Volume Reversal)", "Value Zone Pullback Only", "Volume Breakout Reversal Only"], group=grp_strat)
+signalMode   = input.string("Value Zone Pullback Only", "Signal Mode",
+      options=["Value Zone Pullback Only", "All Confluence (Pullback + Volume Reversal)", "Volume Breakout Reversal Only"], group=grp_strat,
+      tooltip="Backtested best: 'Value Zone Pullback Only' on a 15-minute chart. The volume-breakout engine and 5-minute charts showed no edge over 60 days across the watchlist.")
 confirmClose = input.bool(true, "Evaluate Signals On Bar Close Only (Non-Repainting)", group=grp_strat,
       tooltip="CALL / PUT / exit signals are only evaluated on the final tick of a bar, so labels never appear and disappear intrabar. Keep alerts on 'Once Per Bar Close'.")
 cooldownBars = input.int(0, "Cooldown Bars After An Exit (0 = Off)", minval=0, group=grp_strat,
@@ -420,6 +421,10 @@ if showDash and barstate.islast
     f_cell(1, 11, lvlTxt, cHead)
     f_cell(0, 12, "TP1 / TP2 / P&L", cHead)
     f_cell(1, 12, tgtTxt, pnlCol)
+
+var table tfNote = table.new(position.bottom_right, 1, 1)
+if barstate.islast and timeframe.isintraday and timeframe.period != "15"
+    table.cell(tfNote, 0, 0, "Tuned for the 15m chart (now " + timeframe.period + "m)", text_color=color.black, bgcolor=color.new(#FFD600, 0), text_size=size.small)
 
 // --- 7. ALERTS & WEBHOOK PAYLOADS -----------------------------------------
 // Classic per-condition alerts. Placeholders reference plots BY TITLE (robust to plot ordering).

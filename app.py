@@ -81,7 +81,7 @@ def save_env_var(key: str, value: str):
 TELEGRAM_BOT_TOKEN = load_env_var("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = load_env_var("TELEGRAM_CHAT_ID", "")
 SCANNER_MODE = load_env_var("SCANNER_MODE", "MARKET_HOURS") # MARKET_HOURS, ALWAYS_ON, OFF
-SIGNAL_MODE = load_env_var("SIGNAL_MODE", "ALL_CONFLUENCE") # ALL_CONFLUENCE, PULLBACK_ONLY, BREAKOUT_ONLY
+SIGNAL_MODE = load_env_var("SIGNAL_MODE", "PULLBACK_ONLY") # ALL_CONFLUENCE, PULLBACK_ONLY, BREAKOUT_ONLY
 DEFAULT_WATCHLIST = "AAPL,AMZN,COIN,GOOGL,HOOD,INTC,IWM,META,MRVL,MSFT,MU,NBIS,NFLX,NVDA,PLTR,QQQ,SNDK,SPCX,SPX,SPY,TSLA,UNH,WMT"
 WATCHLIST_STR = load_env_var("WATCHLIST", DEFAULT_WATCHLIST)
 
@@ -233,7 +233,7 @@ class ConfigInput(BaseModel):
     telegram_bot_token: str
     telegram_chat_id: str
     scanner_mode: Optional[str] = "MARKET_HOURS"
-    signal_mode: Optional[str] = "ALL_CONFLUENCE"
+    signal_mode: Optional[str] = "PULLBACK_ONLY"
     watchlist: Optional[str] = "SPY,QQQ,TSLA,NVDA,AAPL"
 
 def format_telegram_play(ticker: str, raw_play: str) -> tuple[str, str]:
@@ -368,6 +368,8 @@ scanner_state: Dict[str, Dict] = {} # ticker -> { "last_evaluated_bar": None, "l
 # Telegram alerts keep firing exactly when the chart prints a flag.
 # -----------------------------------------------------------------------------
 PINE_DEFAULTS: Dict = {
+    # Chart timeframe the scanner replicates (5m Yahoo bars are aggregated up, aligned to the 09:30 open)
+    "timeframe_min": 15,
     # Signal Engine
     "cooldown_bars": 0,
     # Trade Lifecycle & Exits
@@ -582,7 +584,7 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
     now = datetime.now(timezone.utc)
     last_bar_time = idx[-1]
     bar_utc = last_bar_time.astimezone(timezone.utc) if last_bar_time.tzinfo is not None else last_bar_time.replace(tzinfo=timezone.utc)
-    closed_end_idx = len(df) - 1 if (now - bar_utc).total_seconds() < 310 else len(df)
+    closed_end_idx = len(df) - 1 if (now - bar_utc).total_seconds() < S["timeframe_min"] * 60 + 10 else len(df)
     if closed_end_idx < max(S["ema_base"], 60):
         return None
 
@@ -813,6 +815,15 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
         "signals": all_signals,
     }
 
+def resample_bars(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """Aggregate 5m bars to the chart timeframe exactly like TradingView RTH bars (anchored at 09:30 exchange time)."""
+    if minutes <= 5:
+        return df
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    loc = df[list(agg)].tz_convert(load_pine_settings()["exchange_tz"])
+    out = loc.resample(f"{int(minutes)}min", origin="start_day", offset="9h30min", label="left", closed="left").agg(agg)
+    return out.dropna(subset=["Close"])
+
 minute_cache: Dict = {"tickers": None, "fetched": float("-inf"), "data": None}
 state_fixed_log: Dict[str, str] = {}
 
@@ -871,9 +882,9 @@ async def market_scanner_loop():
                 yf_map = {tk: ("^GSPC" if tk in ("SPX", "^SPX") else tk) for tk in wl}
                 tickers_str = " ".join(list(dict.fromkeys(yf_map.values())))
 
-                # 30 days of 5m candles (~2,300 bars): lets the 200 EMA, RMA-based RSI / ATR and the trade state
+                # 60 days of 5m candles (Yahoo maximum; ~1,550 bars once aggregated to 15m): lets the 200 EMA, RMA-based RSI / ATR and the trade state
                 # machine fully converge to what the TradingView chart shows (5 days was not enough warm-up).
-                data = await asyncio.to_thread(yf.download, tickers=tickers_str, period="30d", interval="5m", progress=False, auto_adjust=False)
+                data = await asyncio.to_thread(yf.download, tickers=tickers_str, period="60d", interval="5m", progress=False, auto_adjust=False)
 
                 # 1m data (Yahoo keeps ~7 days) is only used to scrub phantom volume prints; refreshed at most once a minute
                 now_ts = asyncio.get_running_loop().time()
@@ -899,6 +910,7 @@ async def market_scanner_loop():
                             if fixed and state_fixed_log.get(tk) != fixed[-1]:
                                 state_fixed_log[tk] = fixed[-1]
                                 log.info("Scrubbed phantom Yahoo volume on %s bars: %s", tk, ", ".join(f[5:16] for f in fixed[-3:]))
+                            df = resample_bars(df, load_pine_settings()["timeframe_min"])
                             result = evaluate_pine_indicator(df)
                             if result is None:
                                 continue
@@ -1763,8 +1775,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="form-group">
         <label>Signal Mode (TradingView Alignment)</label>
         <select id="cfg-signal-mode" class="form-input">
+          <option value="PULLBACK_ONLY">Value Zone Pullback Only (Recommended, 15m)</option>
           <option value="ALL_CONFLUENCE">All Confluence (Pullback + Volume Reversal)</option>
-          <option value="PULLBACK_ONLY">Value Zone Pullback Only</option>
           <option value="BREAKOUT_ONLY">Volume Breakout Reversal Only</option>
         </select>
       </div>
@@ -1997,7 +2009,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           document.getElementById('cfg-token').value = d.telegram_bot_token || '';
           document.getElementById('cfg-chat').value = d.telegram_chat_id || '';
           document.getElementById('cfg-scanner').value = d.scanner_mode || 'MARKET_HOURS';
-          document.getElementById('cfg-signal-mode').value = d.signal_mode || 'ALL_CONFLUENCE';
+          document.getElementById('cfg-signal-mode').value = d.signal_mode || 'PULLBACK_ONLY';
           document.getElementById('cfg-watchlist').value = d.watchlist || 'AAPL,AMZN,COIN,GOOGL,HOOD,INTC,IWM,META,MRVL,MSFT,MU,NBIS,NFLX,NVDA,PLTR,QQQ,SNDK,SPCX,SPX,SPY,TSLA,UNH,WMT';
           document.getElementById('config-modal').classList.add('open');
         });
