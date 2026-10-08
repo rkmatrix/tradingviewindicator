@@ -759,6 +759,48 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
         "signals": all_signals,
     }
 
+minute_cache: Dict = {"tickers": None, "fetched": float("-inf"), "data": None}
+state_fixed_log: Dict[str, str] = {}
+
+def _extract_ticker(data: Optional[pd.DataFrame], yf_tk: str, single: bool) -> Optional[pd.DataFrame]:
+    if data is None or data.empty:
+        return None
+    if isinstance(data.columns, pd.MultiIndex):
+        return data.xs(yf_tk, level=1, axis=1) if yf_tk in data.columns.levels[1] else None
+    return data if single else None
+
+PHANTOM_VOL_MULT = 30.0     # a 1m print this many times its neighbourhood median is a Yahoo artefact
+PHANTOM_VOL_WINDOW = 31     # centred 1m window used for that median
+
+def strip_phantom_volume(df5: pd.DataFrame, df1: Optional[pd.DataFrame]) -> tuple[pd.DataFrame, List[str]]:
+    """
+    Yahoo's intraday feed injects isolated 1-minute volume prints of 100-500x normal (e.g. SPY 7.5M shares in a
+    minute surrounded by ~30k) that do not exist on TradingView. They fake a volume surge and make the scanner fire
+    signals the chart never prints. Subtract each phantom print's excess over its local median from its 5m bar.
+    The first and last 5 minutes of the session are left alone because genuine auction volume lives there.
+    """
+    if df1 is None or df1.empty or "Volume" not in df1.columns:
+        return df5, []
+    v1 = df1["Volume"].astype(float).dropna()
+    if v1.empty:
+        return df5, []
+    med = v1.rolling(PHANTOM_VOL_WINDOW, center=True, min_periods=5).median()
+    local = v1.index.tz_convert(load_pine_settings()["exchange_tz"]) if v1.index.tz is not None else v1.index
+    mins = local.hour * 60 + local.minute
+    edge = (mins < 9 * 60 + 35) | (mins >= 15 * 60 + 55)
+    spike = (med > 0) & (v1 > med * PHANTOM_VOL_MULT) & ~edge
+    if not spike.any():
+        return df5, []
+    excess = (v1 - med).where(spike, 0.0)
+    excess5 = excess.groupby(excess.index.floor("5min")).sum()
+    excess5 = excess5[excess5 > 0]
+    hit = excess5.reindex(df5.index).fillna(0.0)
+    if not (hit > 0).any():
+        return df5, []
+    out = df5.copy()
+    out["Volume"] = (out["Volume"].astype(float) - hit).clip(lower=0.0)
+    return out, [str(t) for t in hit[hit > 0].index]
+
 async def market_scanner_loop():
     global SCANNER_MODE, WATCHLIST_STR
     log.info("Market Scanner Background Worker (Pine v5 Confluence Engine) Started.")
@@ -779,19 +821,30 @@ async def market_scanner_loop():
                 # machine fully converge to what the TradingView chart shows (5 days was not enough warm-up).
                 data = await asyncio.to_thread(yf.download, tickers=tickers_str, period="30d", interval="5m", progress=False, auto_adjust=False)
 
+                # 1m data (Yahoo keeps ~7 days) is only used to scrub phantom volume prints; refreshed at most once a minute
+                now_ts = asyncio.get_running_loop().time()
+                if minute_cache["tickers"] != tickers_str or now_ts - minute_cache["fetched"] >= 60:
+                    try:
+                        minute_cache["data"] = await asyncio.to_thread(yf.download, tickers=tickers_str, period="7d", interval="1m", progress=False, auto_adjust=False)
+                        minute_cache["tickers"] = tickers_str
+                        minute_cache["fetched"] = now_ts
+                    except Exception as e:
+                        log.warning("1m volume download failed (%s) - using raw 5m volume", e)
+
                 if data is not None and not data.empty:
+                    single = len(dict.fromkeys(yf_map.values())) == 1
                     for tk in wl:
                         try:
                             yf_tk = yf_map[tk]
-                            if isinstance(data.columns, pd.MultiIndex):
-                                df = data.xs(yf_tk, level=1, axis=1) if yf_tk in data.columns.levels[1] else None
-                            else:
-                                df = data if len(wl) == 1 else None
-
+                            df = _extract_ticker(data, yf_tk, single)
                             if df is None or df.empty:
                                 continue
 
                             df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+                            df, fixed = strip_phantom_volume(df, _extract_ticker(minute_cache["data"], yf_tk, single))
+                            if fixed and state_fixed_log.get(tk) != fixed[-1]:
+                                state_fixed_log[tk] = fixed[-1]
+                                log.info("Scrubbed phantom Yahoo volume on %s bars: %s", tk, ", ".join(f[5:16] for f in fixed[-3:]))
                             result = evaluate_pine_indicator(df)
                             if result is None:
                                 continue
