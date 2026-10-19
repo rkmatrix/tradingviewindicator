@@ -123,6 +123,8 @@ Backtest (`research/tune.py`, walk-forward, 60 days x 23 symbols, scored in R = 
 
 Known limits: Yahoo's free feed can trail the exchange by a few seconds to a minute and its index prints can differ slightly from TradingView's data vendor, so an entry that sits exactly on a threshold may occasionally differ by one bar. For zero-lag parity on a specific symbol, use the TradingView webhook (Option A above) in addition to or instead of the scanner.
 
+**Flag feed for bots.** Every flag the server dispatches (scanner or webhook) is appended to `data/flags.jsonl` and served, oldest first, by `GET /api/flags?since=<last id>`. Each event has `id`, `ts`, `ticker`, `action` (`BUY_CALL` / `BUY_PUT` / `TP_CALL` / `TP_PUT`), `price`, `sl`, `tp1`, `tp2`, `engine`, `bar_time`, `exit_code` and `pnl_pct`. The SignalValidator AlphaWave paper trader (`dosv/alphawave_paper`) polls this feed and paper-trades one option per flag.
+
 ---
 
 ## 💻 How to Add to Webull Desktop

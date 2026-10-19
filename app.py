@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import urllib.error
 import urllib.request
 import zoneinfo
@@ -256,12 +257,76 @@ def format_telegram_play(ticker: str, raw_play: str) -> tuple[str, str]:
     
     return p, f"{p} {tk}"
 
-def record_and_dispatch(ticker: str, raw_play: str, price: Optional[float] = None) -> dict:
+# --- Flag feed: every dispatched flag, in order, for downstream consumers (e.g. the SignalValidator paper bot) ---
+FLAGS_FILE = DATA_DIR / "flags.jsonl"
+_flags_lock = threading.Lock()
+_flag_seq: Optional[int] = None
+
+def _last_flag_id() -> int:
+    if not FLAGS_FILE.exists():
+        return 0
+    last = 0
+    with FLAGS_FILE.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                last = max(last, int(json.loads(line).get("id", 0)))
+            except Exception:
+                continue
+    return last
+
+def append_flag(tk: str, raw_play: str, price: Optional[float], meta: Optional[dict] = None) -> Optional[dict]:
+    """Normalise a flag to BUY_CALL / BUY_PUT / TP_CALL / TP_PUT and append it to data/flags.jsonl."""
+    global _flag_seq
+    p = (raw_play or "").upper()
+    is_exit = any(k in p for k in ("TP", "TAKE PROFIT", "PROFIT", "EXIT"))
+    side = "CALL" if "CALL" in p else "PUT" if "PUT" in p else None
+    if side is None:
+        return None
+    meta = meta or {}
+    with _flags_lock:
+        if _flag_seq is None:
+            _flag_seq = _last_flag_id()
+        _flag_seq += 1
+        ev = {
+            "id": _flag_seq,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "ticker": tk,
+            "action": f"TP_{side}" if is_exit else f"BUY_{side}",
+            "price": None if price is None else float(price),
+            "bar_time": meta.get("bar_time"),
+            "engine": meta.get("engine"),
+            "sl": meta.get("sl"), "tp1": meta.get("tp1"), "tp2": meta.get("tp2"),
+            "exit_code": meta.get("exit_code"), "pnl_pct": meta.get("pnl_pct"),
+            "source": meta.get("source", "scanner"),
+        }
+        with FLAGS_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(ev) + "\n")
+    return ev
+
+def read_flags(since: int = 0, limit: int = 500) -> List[Dict]:
+    if not FLAGS_FILE.exists():
+        return []
+    out: List[Dict] = []
+    with _flags_lock, FLAGS_FILE.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if int(ev.get("id", 0)) > since:
+                out.append(ev)
+    return out[:limit]
+
+def record_and_dispatch(ticker: str, raw_play: str, price: Optional[float] = None, meta: Optional[dict] = None) -> dict:
     tk = ticker.strip().upper()
     dash_play, tg_message = format_telegram_play(tk, raw_play)
 
     # 1. Zero delay send to Telegram FIRST (non-blocking)
     send_telegram_instant(tg_message)
+    try:
+        append_flag(tk, raw_play, price, meta)
+    except Exception as e:
+        log.warning("Could not append flag to %s: %s", FLAGS_FILE, e)
 
     # 2. Update Side-by-Side Tables
     p_upper = (raw_play or "").upper()
@@ -978,7 +1043,10 @@ async def market_scanner_loop():
                                 log.info("Pine Indicator Signal Confirmed: %s %s at %.2f (Bar: %s, engine=%s%s)",
                                          sig['type'], tk, sig['price'], sig['bar_time'], sig.get('engine'),
                                          f", exit_code={sig['exit_code']}" if 'exit_code' in sig else "")
-                                record_and_dispatch(tk, sig['type'], sig['price'])
+                                record_and_dispatch(tk, sig['type'], sig['price'], meta={
+                                    "source": "scanner", "bar_time": sig.get("bar_time"), "engine": sig.get("engine"),
+                                    "sl": sig.get("sl"), "tp1": sig.get("tp1"), "tp2": sig.get("tp2"),
+                                    "exit_code": sig.get("exit_code"), "pnl_pct": sig.get("pnl_pct")})
 
                         except Exception as e:
                             log.warning("Error evaluating ticker %s: %s", tk, e)
@@ -1011,6 +1079,12 @@ async def get_signals():
         "tz_label": "CST"
     }
 
+@app.get("/api/flags")
+async def get_flags(since: int = 0, limit: int = 500):
+    """Flag feed for downstream bots: every CALL / PUT / TP flag with id > since, oldest first."""
+    flags = read_flags(since, max(1, min(limit, 5000)))
+    return {"flags": flags, "last_id": flags[-1]["id"] if flags else since}
+
 @app.post("/api/signal")
 @app.post("/webhook")
 async def ingest_signal(req: Request):
@@ -1024,12 +1098,15 @@ async def ingest_signal(req: Request):
     ticker = "SPY"
     raw_play = "CALL"
     price = None
+    meta: Dict = {"source": "webhook"}
 
     try:
         data = json.loads(body_text)
         ticker = data.get("ticker") or data.get("symbol") or "SPY"
         raw_play = data.get("play") or data.get("action") or data.get("signal") or "CALL"
         price = data.get("price")
+        meta.update({k: data.get(k) for k in ("sl", "tp1", "tp2", "engine", "pnl_pct", "exit_code") if data.get(k) is not None})
+        meta["bar_time"] = data.get("time")
     except Exception:
         parts = body_text.split()
         if len(parts) >= 2:
@@ -1043,7 +1120,7 @@ async def ingest_signal(req: Request):
                         ticker = p
                         break
 
-    entry = record_and_dispatch(ticker, raw_play, price)
+    entry = record_and_dispatch(ticker, raw_play, price, meta=meta)
     return {
         "status": "ok",
         "ticker": entry.get("ticker"),
