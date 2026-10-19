@@ -91,7 +91,15 @@ The dashboard (`app.py`) treats any `action` containing `TP` or `EXIT` as a posi
 
 ## ✅ Recommended Setup (Backtested)
 
-Use a **15-minute chart** with **Signal Mode = Value Zone Pullback Only** (the default). A walk-forward backtest over 60 days x 23 symbols (`research/tune.py`) showed the 5-minute chart and the volume-breakout engine have no edge (about 7 trades per symbol per day, ~29% winners, ~0R expectancy), while 15m pullback-only held a small positive edge on the held-out sessions (+0.045R per trade, profit factor ~1.09). Treat it as a thin edge: size small and expect option spreads and theta to eat into it. The indicator shows a yellow note when it is not on a 15m chart, and the Telegram scanner aggregates its 5m feed to 15m bars to match (`timeframe_min` in `data/pine_settings.json`).
+Use a **5-minute chart** with the defaults: **Signal Mode = Value Zone Pullback Only** and the **No-Trade Filter** on (group 4c):
+
+- **Require Expanding Volatility** - no CALL / PUT while ATR(14) is below its 50-bar average. Quiet, sideways tape rarely moves far enough to pay for option premium.
+- **Require Next-Bar Follow-Through** - the flag prints one bar after the setup, only if that bar closes beyond the setup bar (CALL above its high, PUT below its low).
+- *Block Choppy Markets* (Choppiness Index) is available but off; it did not add value in testing.
+
+The dashboard's **Move Filter** row shows `OK`, `QUIET` or `CHOPPY` so you can see when signals are being withheld.
+
+Backtest (`research/tune.py`, walk-forward, 60 days x 23 symbols, scored in R = P&L / initial stop): the old 5m defaults took ~7 trades per symbol per day at ~0R. This setup cuts trades by ~80% to roughly 0.6 per symbol per day and was the only configuration that stayed positive on both the tuning and the held-out sessions, but only barely (about +0.01R per trade). **The indicator has no proven edge: treat signals as candidates, paper trade first, and size small.** The 15-minute variant tested earlier did not hold up on newer data.
 
 ---
 

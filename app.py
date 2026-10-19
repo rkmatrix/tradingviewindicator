@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 # =============================================================================
 # ALPHAWAVE SIGNAL DASHBOARD & ZERO-DELAY TELEGRAM DISPATCHER
-# Matches C:\Projects\trading\PA & SignalValidator Architecture
+# Matches C:\Projects\trading\SignalValidator (PA desk lives in pa_desk) Architecture
 # Includes Automated Market Hours Live Scanner & Webhook Receiver
 # =============================================================================
 
@@ -31,7 +31,7 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SIGNALS_FILE = DATA_DIR / "signals.json"
 ENV_FILE = BASE_DIR / ".env"
-PA_ENV_FILE = Path("C:/Projects/trading/PA/.env")
+PA_ENV_FILE = Path("C:/Projects/trading/SignalValidator/pa_desk/.env")
 
 # --- Environment & Configuration Loading ---
 def load_env_var(key: str, default: str = "") -> str:
@@ -369,7 +369,7 @@ scanner_state: Dict[str, Dict] = {} # ticker -> { "last_evaluated_bar": None, "l
 # -----------------------------------------------------------------------------
 PINE_DEFAULTS: Dict = {
     # Chart timeframe the scanner replicates (5m Yahoo bars are aggregated up, aligned to the 09:30 open)
-    "timeframe_min": 15,
+    "timeframe_min": 5,
     # Signal Engine
     "cooldown_bars": 0,
     # Trade Lifecycle & Exits
@@ -405,6 +405,13 @@ PINE_DEFAULTS: Dict = {
     "max_losses_per_day": 0,      # stop taking entries on a symbol after N losing trades that day
     "loss_cooldown_bars": 0,      # bars to wait after a losing exit
     "use_orb": False, "orb_min": 30,  # after the opening range: CALL only above OR high, PUT only below OR low
+    # 4d. Move-potential guards (0 / False = off)
+    "min_atr_pct": 0.0,           # ATR must be at least this % of price (enough range to pay for the option premium)
+    "atr_expand_len": 50,         # ATR must be >= its SMA over this many bars x atr_expand_mult (volatility not contracting)
+    "atr_expand_mult": 1.0,
+    "chop_len": 14, "chop_max": 0.0,  # Choppiness Index must be below this (61.8 = classic "sideways" line)
+    "rsi_floor": 0.0,             # no PUT with RSI below this / no CALL above 100 - this (move already spent)
+    "confirm_next": True,         # wait one bar: CALL only if the next bar closes above the signal bar high (PUT: below its low)
     # Exchange time zone used for the session filter and HTF bar alignment (TradingView uses the symbol's exchange tz)
     "exchange_tz": "America/New_York",
 }
@@ -550,6 +557,11 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
     else:
         adx = np.full(len(c), np.nan)
 
+    tr_s = pine_tr(h, l, c)
+    chop_n = int(S["chop_len"])
+    chop = (100 * np.log10(tr_s.rolling(chop_n).sum() / (h.rolling(chop_n).max() - l.rolling(chop_n).min())) / np.log10(chop_n)).to_numpy()
+    atr_avg = pd.Series(atr, index=c.index).rolling(int(S["atr_expand_len"])).mean().to_numpy() if S["atr_expand_len"] > 0 else None
+
     vol_sma = v.rolling(S["vol_len"]).mean()
     vol_med = v.rolling(S["vol_len"]).median()
     vol_base = (vol_sma if str(S["vol_baseline"]).upper().startswith("SMA") else vol_med).to_numpy()
@@ -606,6 +618,8 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
     last_loss_bar = None
     loss_day = None
     losses_today = 0
+    prev_raw_call = prev_raw_put = False
+    prev_pb_call = prev_pb_put = False
 
     all_signals: List[Dict] = []
 
@@ -712,11 +726,27 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
         orb_call = (not S["use_orb"]) or (or_done[i] and not np.isnan(or_hi[i]) and close > or_hi[i])
         orb_put = (not S["use_orb"]) or (or_done[i] and not np.isnan(or_lo[i]) and close < or_lo[i])
 
-        raw_call_pre = gate_ok and htf_ok_call and mode_call and guard_ok and vwap_call and orb_call
-        raw_put_pre = gate_ok and htf_ok_put and mode_put and guard_ok and vwap_put and orb_put
+        # Move-potential guards
+        move_ok = (S["min_atr_pct"] <= 0 or a / close * 100 >= S["min_atr_pct"]) and \
+                  (atr_avg is None or (not np.isnan(atr_avg[i]) and a >= atr_avg[i] * S["atr_expand_mult"])) and \
+                  (S["chop_max"] <= 0 or (not np.isnan(chop[i]) and chop[i] < S["chop_max"]))
+        rsi_call_ok = S["rsi_floor"] <= 0 or r <= 100 - S["rsi_floor"]
+        rsi_put_ok = S["rsi_floor"] <= 0 or r >= S["rsi_floor"]
+
+        raw_call_pre = gate_ok and htf_ok_call and mode_call and guard_ok and vwap_call and orb_call and move_ok and rsi_call_ok
+        raw_put_pre = gate_ok and htf_ok_put and mode_put and guard_ok and vwap_put and orb_put and move_ok and rsi_put_ok
         conflict = raw_call_pre and raw_put_pre
-        raw_call = raw_call_pre and not conflict
-        raw_put = raw_put_pre and not conflict
+        setup_call = raw_call_pre and not conflict
+        setup_put = raw_put_pre and not conflict
+        if S["confirm_next"]:
+            raw_call = prev_raw_call and close > hn[i - 1] and gate_ok
+            raw_put = prev_raw_put and close < ln[i - 1] and gate_ok
+            pb_call_tag, pb_put_tag = prev_pb_call, prev_pb_put
+        else:
+            raw_call, raw_put = setup_call, setup_put
+            pb_call_tag, pb_put_tag = pullback_call, pullback_put
+        prev_raw_call, prev_raw_put = setup_call, setup_put
+        prev_pb_call, prev_pb_put = pullback_call, pullback_put
 
         # --- 4. TRADE LIFECYCLE STATE MACHINE ---
         in_call = pos_dir == 1
@@ -790,7 +820,7 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
             entry_px = close
             entry_bar = i
             tp1_done = False
-            engine_used = "PULLBACK" if (pullback_call if call_signal else pullback_put) else "BREAKOUT"
+            engine_used = "PULLBACK" if (pb_call_tag if call_signal else pb_put_tag) else "BREAKOUT"
             sgn = 1 if call_signal else -1
             sl_level = close - sgn * a * S["sl_atr"]
             tp1_level = close + sgn * a * S["tp1_atr"]
@@ -1775,7 +1805,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="form-group">
         <label>Signal Mode (TradingView Alignment)</label>
         <select id="cfg-signal-mode" class="form-input">
-          <option value="PULLBACK_ONLY">Value Zone Pullback Only (Recommended, 15m)</option>
+          <option value="PULLBACK_ONLY">Value Zone Pullback Only (Recommended)</option>
           <option value="ALL_CONFLUENCE">All Confluence (Pullback + Volume Reversal)</option>
           <option value="BREAKOUT_ONLY">Volume Breakout Reversal Only</option>
         </select>

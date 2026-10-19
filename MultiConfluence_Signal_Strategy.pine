@@ -27,7 +27,7 @@ grp_strat    = "Signal Engine"
 tradeDir     = input.string("Both CALL & PUT", "Allowed Contracts", options=["Both CALL & PUT", "CALL Only", "PUT Only"], group=grp_strat)
 signalMode   = input.string("Value Zone Pullback Only", "Signal Mode",
       options=["Value Zone Pullback Only", "All Confluence (Pullback + Volume Reversal)", "Volume Breakout Reversal Only"], group=grp_strat,
-      tooltip="Backtested best: 'Value Zone Pullback Only' on a 15-minute chart. The volume-breakout engine and 5-minute charts showed no edge over 60 days across the watchlist.")
+      tooltip="Backtested default: 'Value Zone Pullback Only' on a 5-minute chart with the No-Trade Filter on. The volume-breakout engine added trades without adding edge.")
 cooldownBars = input.int(0, "Cooldown Bars After An Exit (0 = Off)", minval=0, group=grp_strat,
       tooltip="Minimum bars after an exit before a new CALL / PUT entry is allowed.")
 
@@ -103,6 +103,17 @@ volBreakMult = input.float(1.10, "Breakout Volume Surge Factor", minval=0.5, ste
 grp_sess     = "4b. Session Filter (Intraday Only)"
 useSession   = input.bool(false, "Only Trade Inside Session", group=grp_sess)
 sessionStr   = input.session("0930-1600", "Session (Exchange Time)", group=grp_sess)
+
+grp_move     = "4c. No-Trade Filter (Sideways / Low Move)"
+useAtrExp    = input.bool(true, "Require Expanding Volatility (ATR >= Its Average)", group=grp_move,
+      tooltip="Blocks CALL / PUT signals while the market is quiet (ATR below its own moving average). Sideways, low-range tape rarely moves far enough to pay for option premium.")
+atrExpLen    = input.int(50, "ATR Average Length", minval=5, group=grp_move)
+atrExpMult   = input.float(1.0, "ATR Must Be At Least (x Average)", minval=0.5, step=0.05, group=grp_move)
+confirmNext  = input.bool(true, "Require Next-Bar Follow-Through", group=grp_move,
+      tooltip="The flag prints one bar later, only if that bar closes beyond the setup bar (CALL: above its high, PUT: below its low). Filters setups that reverse immediately.")
+useChop      = input.bool(false, "Block Choppy Markets (Choppiness Index)", group=grp_move)
+chopLen      = input.int(14, "Choppiness Length", minval=2, group=grp_move)
+chopMax      = input.float(55, "Max Choppiness (61.8 = Sideways)", minval=30, maxval=80, step=0.5, group=grp_move)
 
 grp_dates    = "5. Date Range Filter"
 useDateFilter = input.bool(false, "Enable Custom Date Filter", group=grp_dates)
@@ -195,11 +206,23 @@ breakoutPut  = wasAbovePut  and close < emaFast and close < emaMed and close < o
 modeCall = signalMode == "Value Zone Pullback Only" ? pullbackCall : signalMode == "Volume Breakout Reversal Only" ? breakoutCall : (pullbackCall or breakoutCall)
 modePut  = signalMode == "Value Zone Pullback Only" ? pullbackPut  : signalMode == "Volume Breakout Reversal Only" ? breakoutPut  : (pullbackPut  or breakoutPut)
 
-rawCallPre = gateOk and htfOkCall and modeCall
-rawPutPre  = gateOk and htfOkPut  and modePut
+// No-trade filter: quiet / choppy tape cannot pay for option premium
+atrAvg  = ta.sma(atrVal, atrExpLen)
+chopVal = 100 * math.log10(math.sum(ta.tr(true), chopLen) / (ta.highest(high, chopLen) - ta.lowest(low, chopLen))) / math.log10(chopLen)
+atrExpOk = not useAtrExp or (not na(atrAvg) and atrVal >= atrAvg * atrExpMult)
+chopOk   = not useChop or (not na(chopVal) and chopVal < chopMax)
+moveOk   = atrExpOk and chopOk
+
+rawCallPre = gateOk and htfOkCall and modeCall and moveOk
+rawPutPre  = gateOk and htfOkPut  and modePut  and moveOk
 conflict   = rawCallPre and rawPutPre
-rawCall    = rawCallPre and not conflict
-rawPut     = rawPutPre  and not conflict
+setupCall  = rawCallPre and not conflict
+setupPut   = rawPutPre  and not conflict
+// Follow-through: the setup bar must be confirmed by the next bar closing beyond it
+rawCall    = confirmNext ? (setupCall[1] and close > high[1] and gateOk) : setupCall
+rawPut     = confirmNext ? (setupPut[1]  and close < low[1]  and gateOk) : setupPut
+pbTagCall  = confirmNext ? pullbackCall[1] : pullbackCall
+pbTagPut   = confirmNext ? pullbackPut[1]  : pullbackPut
 
 allowCall = tradeDir != "PUT Only"
 allowPut  = tradeDir != "CALL Only"
@@ -289,7 +312,7 @@ if callSignal
     entryPx    := close
     entryBar   := bar_index
     tp1Done    := false
-    engineUsed := pullbackCall ? "PULLBACK" : "BREAKOUT"
+    engineUsed := pbTagCall ? "PULLBACK" : "BREAKOUT"
     slLevel    := close - atrVal * slAtrMult
     tp1Level   := close + atrVal * tp1AtrMult
     tp2Level   := close + atrVal * tp2AtrMult
@@ -314,7 +337,7 @@ if putSignal
     entryPx    := close
     entryBar   := bar_index
     tp1Done    := false
-    engineUsed := pullbackPut ? "PULLBACK" : "BREAKOUT"
+    engineUsed := pbTagPut ? "PULLBACK" : "BREAKOUT"
     slLevel    := close + atrVal * slAtrMult
     tp1Level   := close - atrVal * tp1AtrMult
     tp2Level   := close - atrVal * tp2AtrMult

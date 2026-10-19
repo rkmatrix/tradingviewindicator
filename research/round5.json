@@ -1,0 +1,11 @@
+{
+  "5m pb base": {"__mode": "PULLBACK"},
+  "5m pb atrExp50": {"__mode": "PULLBACK", "atr_expand_len": 50},
+  "5m pb atrExp50 x1.1": {"__mode": "PULLBACK", "atr_expand_len": 50, "atr_expand_mult": 1.1},
+  "5m pb atrExp100": {"__mode": "PULLBACK", "atr_expand_len": 100},
+  "5m pb atrExp50+chop55": {"__mode": "PULLBACK", "atr_expand_len": 50, "chop_max": 55},
+  "5m pb atrExp50+ext0.8": {"__mode": "PULLBACK", "atr_expand_len": 50, "max_ext_atr": 0.8},
+  "5m pb atrExp50+confirm": {"__mode": "PULLBACK", "atr_expand_len": 50, "confirm_next": true},
+  "5m all atrExp50": {"atr_expand_len": 50},
+  "15m pb atrExp50+chop55": {"__tf": 15, "__mode": "PULLBACK", "atr_expand_len": 50, "chop_max": 55}
+}
