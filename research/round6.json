@@ -1,0 +1,13 @@
+{
+  "current (atrExp+confirm)": {"__mode": "PULLBACK"},
+  "+ er0.3": {"__mode": "PULLBACK", "er_min": 0.3},
+  "+ er0.4": {"__mode": "PULLBACK", "er_min": 0.4},
+  "+ er0.5": {"__mode": "PULLBACK", "er_min": 0.5},
+  "+ fastTrend": {"__mode": "PULLBACK", "fast_trend": true},
+  "+ fastTrend + er0.4": {"__mode": "PULLBACK", "fast_trend": true, "er_min": 0.4},
+  "+ fastTrend + er0.5": {"__mode": "PULLBACK", "fast_trend": true, "er_min": 0.5},
+  "+ fastTrend + sep0.2": {"__mode": "PULLBACK", "fast_trend": true, "min_trend_sep_atr": 0.2},
+  "+ fastTrend + er0.4 + allEngines": {"fast_trend": true, "er_min": 0.4},
+  "no move filter (confirm only)": {"__mode": "PULLBACK", "atr_expand_len": 0},
+  "fastTrend, no move filter": {"__mode": "PULLBACK", "atr_expand_len": 0, "fast_trend": true}
+}

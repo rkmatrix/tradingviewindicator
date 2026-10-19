@@ -411,6 +411,8 @@ PINE_DEFAULTS: Dict = {
     "atr_expand_mult": 1.0,
     "chop_len": 14, "chop_max": 0.0,  # Choppiness Index must be below this (61.8 = classic "sideways" line)
     "rsi_floor": 0.0,             # no PUT with RSI below this / no CALL above 100 - this (move already spent)
+    "er_len": 10, "er_min": 0.0,  # OR-gate for the volatility filter: Kaufman efficiency ratio >= this counts as a real move (steady grind)
+    "fast_trend": False,          # trend from 9 / 21 EMA (close beyond 21, 9 beyond 21) instead of 21 / 50
     "confirm_next": True,         # wait one bar: CALL only if the next bar closes above the signal bar high (PUT: below its low)
     # Exchange time zone used for the session filter and HTF bar alignment (TradingView uses the symbol's exchange tz)
     "exchange_tz": "America/New_York",
@@ -561,6 +563,8 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
     chop_n = int(S["chop_len"])
     chop = (100 * np.log10(tr_s.rolling(chop_n).sum() / (h.rolling(chop_n).max() - l.rolling(chop_n).min())) / np.log10(chop_n)).to_numpy()
     atr_avg = pd.Series(atr, index=c.index).rolling(int(S["atr_expand_len"])).mean().to_numpy() if S["atr_expand_len"] > 0 else None
+    er_n = int(S["er_len"])
+    er = ((c - c.shift(er_n)).abs() / c.diff().abs().rolling(er_n).sum()).to_numpy()
 
     vol_sma = v.rolling(S["vol_len"]).mean()
     vol_med = v.rolling(S["vol_len"]).median()
@@ -620,6 +624,7 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
     losses_today = 0
     prev_raw_call = prev_raw_put = False
     prev_pb_call = prev_pb_put = False
+    diag = S.get("_diag")   # research hook: pass a list to collect per-bar gate states
 
     all_signals: List[Dict] = []
 
@@ -665,8 +670,12 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
         pass200_put = (not strict200) or close < eb
 
         min_sep = a * S["min_trend_sep_atr"]
-        bull_trend = (close > eb if strict200 else close > es) and em > es + min_sep
-        bear_trend = (close < eb if strict200 else close < es) and em < es - min_sep
+        if S["fast_trend"]:
+            bull_trend = (close > eb if strict200 else close > em) and ef > em + min_sep
+            bear_trend = (close < eb if strict200 else close < em) and ef < em - min_sep
+        else:
+            bull_trend = (close > eb if strict200 else close > es) and em > es + min_sep
+            bear_trend = (close < eb if strict200 else close < es) and em < es - min_sep
 
         zone_reach = a * S["zone_tol_atr"] if zone_atr else em * S["zone_tol_pct"] / 100
         zone_depth = a * S["zone_depth_atr"] if zone_atr else es * S["zone_depth_pct"] / 100
@@ -727,8 +736,9 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
         orb_put = (not S["use_orb"]) or (or_done[i] and not np.isnan(or_lo[i]) and close < or_lo[i])
 
         # Move-potential guards
-        move_ok = (S["min_atr_pct"] <= 0 or a / close * 100 >= S["min_atr_pct"]) and \
-                  (atr_avg is None or (not np.isnan(atr_avg[i]) and a >= atr_avg[i] * S["atr_expand_mult"])) and \
+        atr_exp_ok = atr_avg is None or (not np.isnan(atr_avg[i]) and a >= atr_avg[i] * S["atr_expand_mult"])
+        er_ok = S["er_min"] > 0 and not np.isnan(er[i]) and er[i] >= S["er_min"]
+        move_ok = (S["min_atr_pct"] <= 0 or a / close * 100 >= S["min_atr_pct"]) and (atr_exp_ok or er_ok) and \
                   (S["chop_max"] <= 0 or (not np.isnan(chop[i]) and chop[i] < S["chop_max"]))
         rsi_call_ok = S["rsi_floor"] <= 0 or r <= 100 - S["rsi_floor"]
         rsi_put_ok = S["rsi_floor"] <= 0 or r >= S["rsi_floor"]
@@ -747,6 +757,11 @@ def evaluate_pine_indicator(df: pd.DataFrame, settings: Optional[Dict] = None) -
             pb_call_tag, pb_put_tag = pullback_call, pullback_put
         prev_raw_call, prev_raw_put = setup_call, setup_put
         prev_pb_call, prev_pb_put = pullback_call, pullback_put
+        if diag is not None:
+            diag.append({"t": idx[i], "c": close, "bearTrend": bear_trend, "bearTouch": bear_touch, "bearTurn": bear_turn,
+                         "bearResume": bear_resume, "volOk": vol_ok_pull, "pbPut": pullback_put, "boPut": breakout_put,
+                         "moveOk": move_ok, "atr": a, "atrAvg": None if atr_avg is None else atr_avg[i], "rsi": r, "hist": hl,
+                         "setupPut": setup_put, "rawPut": raw_put, "pos": pos_dir})
 
         # --- 4. TRADE LIFECYCLE STATE MACHINE ---
         in_call = pos_dir == 1
