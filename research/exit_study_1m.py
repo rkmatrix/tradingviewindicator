@@ -55,11 +55,14 @@ def walk(m1, entry, exit_, rule):
     tp1R = abs(entry["tp1"] - e) / risk
     t0 = pd.Timestamp(entry["bar_time"]) + pd.Timedelta(minutes=5)
     t1 = pd.Timestamp(exit_["bar_time"]) + pd.Timedelta(minutes=5)
+    ignore_fade = rule.get("ignore_codes") and exit_.get("exit_code") in rule["ignore_codes"]
+    if ignore_fade:
+        t1 = t0.tz_convert("America/New_York").normalize().tz_convert("UTC") + pd.Timedelta(hours=24)
     w = m1[(m1.index >= t0) & (m1.index < t1)]
     if w.empty:
         return None
-    base_R = sgn * (exit_["price"] - e) / risk
-    peak, stop = 0.0, -99.0
+    base_R = sgn * (w["Close"].iloc[-1] - e) / risk if ignore_fade else sgn * (exit_["price"] - e) / risk
+    peak, stop = 0.0, (-1.0 if ignore_fade else -99.0)
     for ts, row in w.iterrows():
         fav = sgn * ((row["High"] if sgn > 0 else row["Low"]) - e) / risk
         adv = sgn * ((row["Low"] if sgn > 0 else row["High"]) - e) / risk
@@ -91,6 +94,8 @@ RULES = {
     "trail 0.3R after +0.5R": {"arm": 0.5, "trail": 0.3},
     "trail 0.25R after +0.4R": {"arm": 0.4, "trail": 0.25},
     "trail 0.2R after +0.3R": {"arm": 0.3, "trail": 0.2},
+    "trail .3/.3, ignore momentum-fade exits": {"arm": 0.3, "trail": 0.3, "ignore_codes": (1,)},
+    "trail .3/.3, ignore fade + time exits": {"arm": 0.3, "trail": 0.3, "ignore_codes": (1, 4)},
 }
 
 
